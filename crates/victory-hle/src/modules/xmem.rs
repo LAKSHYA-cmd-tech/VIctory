@@ -17,16 +17,13 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_FREE,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
-use windows_sys::Win32::System::ProcessStatus::{
-    K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
-    PROCESS_MEMORY_COUNTERS,
-};
+use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
@@ -49,6 +46,103 @@ pub(crate) fn on_wine() -> bool {
 
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
+/// Bytes currently live in [`XMemAllocDefault`] heap blocks (all and GPU-optimal).
+static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
+static HEAP_GPU_OPTIMAL_USED: AtomicUsize = AtomicUsize::new(0);
+/// Non-placeholder [`XMemVirtualAlloc`] reservations: base -> (length, gpu_optimal).
+/// Queried for committed pages when reporting working-set statistics so host
+/// allocations (GPU mirrors, shader compiler) are excluded and `VirtualFree`
+/// decommits/releases are observed automatically.
+static VIRTUAL_REGIONS: LazyLock<Mutex<BTreeMap<usize, (usize, bool)>>> =
+    LazyLock::new(Default::default);
+
+fn saturating_sub(counter: &AtomicUsize, delta: usize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(cur.saturating_sub(delta))
+    });
+}
+
+fn record_virtual_region(at: usize, requested: usize, gpu_optimal: bool) {
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: pseudo-handle and writable MEMORY_BASIC_INFORMATION.
+    let queried = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            at as *const c_void,
+            &mut mbi,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    let len = if queried != 0 && mbi.RegionSize > 0 {
+        mbi.RegionSize.max(requested)
+    } else {
+        requested
+    };
+    let end = at.saturating_add(len);
+    let mut regions = VIRTUAL_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    // Drop any stale entry overlapping `[at, end)` (e.g. reused after VirtualFree).
+    let stale: Vec<usize> = regions
+        .iter()
+        .filter(|&(&base, &(rlen, _))| base < end && base.saturating_add(rlen) > at)
+        .map(|(&base, _)| base)
+        .collect();
+    for base in stale {
+        regions.remove(&base);
+    }
+    regions.insert(at, (len, gpu_optimal));
+}
+
+fn virtual_used() -> (usize, usize) {
+    let mut regions = VIRTUAL_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut total = 0usize;
+    let mut gpu_optimal = 0usize;
+    let mut stale = Vec::new();
+    // SAFETY: pseudo-handle needs no closing.
+    let process = unsafe { GetCurrentProcess() };
+    for (&base, &(len, is_gpu)) in regions.iter() {
+        let end = base.saturating_add(len);
+        let mut cur = base;
+        let mut alive = false;
+        while cur < end {
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: valid process handle and writable struct.
+            let ok = unsafe {
+                VirtualQueryEx(
+                    process,
+                    cur as *const c_void,
+                    &mut mbi,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if ok == 0 || mbi.RegionSize == 0 {
+                break;
+            }
+            let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            let next = region_end.min(end);
+            if next <= cur {
+                break;
+            }
+            if mbi.State != MEM_FREE && mbi.AllocationBase as usize == base {
+                alive = true;
+                if mbi.State == MEM_COMMIT {
+                    let bytes = next - cur;
+                    total = total.saturating_add(bytes);
+                    if is_gpu {
+                        gpu_optimal = gpu_optimal.saturating_add(bytes);
+                    }
+                }
+            }
+            cur = next;
+        }
+        if !alive {
+            stale.push(base);
+        }
+    }
+    for base in stale {
+        regions.remove(&base);
+    }
+    (total, gpu_optimal)
+}
 
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
@@ -138,7 +232,7 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
+    let allocate = |parameter: &mut MEM_EXTENDED_PARAMETER| unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
@@ -146,13 +240,36 @@ pub extern "system" fn XMemVirtualAlloc(
             kind,
             protect,
             if constrained {
-                &mut parameter
+                parameter
             } else {
                 std::ptr::null_mut()
             },
             constrained.into(),
         )
     };
+    let mut at = allocate(&mut parameter);
+    // A 32-bit request that found no room below 4 GiB: the guards there
+    // make way for it.
+    while at.is_null() && constrained && highest < FOUR_GIB {
+        let Some(released) = low_guards::release(size) else {
+            break;
+        };
+        at = allocate(&mut parameter);
+        low_guards::reguard(released);
+    }
+    if !at.is_null() && !placeholder {
+        let addr = at as usize;
+        let already_tracked = !constrained && {
+            let regions = VIRTUAL_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+            regions
+                .range(..=addr)
+                .next_back()
+                .is_some_and(|(&rbase, &(rlen, _))| addr < rbase.saturating_add(rlen))
+        };
+        if !already_tracked {
+            record_virtual_region(addr, size, flags & GRAPHICS != 0);
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -204,12 +321,20 @@ pub extern "system" fn XMemVirtualQuery(
 }
 
 // `XMemAlloc` attributes: alignment as log2 (5 bits at 24, 4 bytes and up
-// from 2), then the memory type, then bit 33: a 32-bit address.
+// from 2), then the memory type (4 bits at 29; non-zero = graphics/GPU),
+// then bit 33: a 32-bit address.
 const ALIGNMENT_SHIFT: u64 = 24;
+const ALLOC_TYPE_SHIFT: u64 = 29;
+const ALLOC_TYPE_MASK: u64 = 0xf;
 const ALLOC_32BIT: u64 = 1 << 33;
-/// Our block header: the block's size and alignment, just below the
-/// pointer handed out.
+/// Our block header: the block's size and alignment (bit 0 packs `gpu_optimal`,
+/// since alignment is always a power of two >= 16), just below the pointer
+/// handed out.
 const HEADER: usize = 2 * size_of::<usize>();
+
+fn is_alloc_gpu_optimal(attributes: u64) -> bool {
+    ((attributes >> ALLOC_TYPE_SHIFT) & ALLOC_TYPE_MASK) != 0
+}
 
 fn layout(size: usize, attributes: u64) -> Option<Layout> {
     // An alignment of at least 16 leaves room for the header.
@@ -298,13 +423,18 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     if block.is_null() {
         return block.cast();
     }
+    let gpu_optimal = is_alloc_gpu_optimal(attributes);
+    HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
+    if gpu_optimal {
+        HEAP_GPU_OPTIMAL_USED.fetch_add(layout.size(), Ordering::Relaxed);
+    }
     // SAFETY: the block holds the alignment (at least the header) and then
-    // `size` bytes.
+    // `size` bytes. Alignment is a power of two >= 16 so bit 0 is free.
     unsafe {
         let user = block.add(layout.align());
         user.sub(HEADER)
             .cast::<[usize; 2]>()
-            .write([layout.size(), layout.align()]);
+            .write([layout.size(), layout.align() | usize::from(gpu_optimal)]);
         user.cast()
     }
 }
@@ -318,15 +448,25 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            VIRTUAL_REGIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(address as usize));
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
-        let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        let [size, packed_align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        let gpu_optimal = (packed_align & 1) != 0;
+        let align = packed_align & !1;
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
         );
+        saturating_sub(&HEAP_USED, size);
+        if gpu_optimal {
+            saturating_sub(&HEAP_GPU_OPTIMAL_USED, size);
+        }
     }
 }
 
@@ -342,7 +482,10 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    gpu_optimal: bool,
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -352,7 +495,7 @@ unsafe impl Sync for Section {}
 impl Drop for Section {
     fn drop(&mut self) {
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -368,6 +511,7 @@ struct Slice {
 struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
+    gpu_optimal_pages: usize,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
 }
@@ -428,10 +572,17 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let gpu_optimal = flags & GRAPHICS != 0;
+    let section = Arc::new(Section {
+        handle,
+        gpu_optimal,
+    });
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
+    if gpu_optimal {
+        physical.gpu_optimal_pages = physical.gpu_optimal_pages.saturating_add(n);
+    }
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -458,7 +609,11 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        if let Some(slice) = physical.pages.remove(&unsafe { *pages.add(i) })
+            && slice.section.gpu_optimal
+        {
+            physical.gpu_optimal_pages = physical.gpu_optimal_pages.saturating_sub(1);
+        }
     }
     1
 }
@@ -478,7 +633,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -701,7 +856,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -846,26 +1001,34 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
-/// The title's budget and our process's commit as what it uses. No tools
-/// memory: a retail console.
-// shortcut: all fields are filled whatever the flags ask for, and use is
-// not split by bandwidth class (GPU-optimal use reads 0); track
-// allocations per class if a title budgets from that field.
+/// The title's budget and its tracked allocations (`XMemAllocDefault`,
+/// committed `XMemVirtualAlloc` regions, and allocated physical pages),
+/// excluding host-side allocations such as D3D12 mirrors and shader compiler
+/// memory. No tools memory: a retail console.
 pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
     if out.is_null() {
         return 0;
     }
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
+    let (virt_total, virt_gpu) = virtual_used();
+    let (phys_pages, phys_gpu_pages) = {
+        let physical = physical();
+        (physical.pages.len(), physical.gpu_optimal_pages)
     };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    let heap_total = HEAP_USED.load(Ordering::Relaxed);
+    let heap_gpu = HEAP_GPU_OPTIMAL_USED.load(Ordering::Relaxed);
+    let title_used = virt_total
+        .saturating_add(phys_pages.saturating_mul(PAGE))
+        .saturating_add(heap_total);
+    let gpu_optimal_used = virt_gpu
+        .saturating_add(phys_gpu_pages.saturating_mul(PAGE))
+        .saturating_add(heap_gpu);
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used,
+        physical_pages: u32::try_from(phys_pages).unwrap_or(u32::MAX),
         gpu_optimal_limit: gpu_optimal,
+        gpu_optimal_used,
         ..Default::default()
     };
     // SAFETY: checked non-null; the title passes room for the structure.
@@ -998,7 +1161,7 @@ mod tests {
     fn transfers_shrink_the_title_budget() {
         let mut before = WorkingSet::default();
         assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut before), 1);
-        assert!(before.title_used > 0);
+        assert!(before.title_limit > 0);
         assert_eq!(XMemTransferMemory(0, 128 * MIB - 1), 1);
         assert_eq!(XMemTransferMemory(2, MIB), 0, "no tools memory");
         let standard = victory_gpu::console::current().title_memory().1;
@@ -1006,6 +1169,89 @@ mod tests {
         let mut after = WorkingSet::default();
         XMemGetWorkingSetStatistics(0x2000_0001, &mut after);
         assert_eq!(before.title_limit - after.title_limit, 128 * MIB);
+    }
+
+    #[test]
+    fn working_set_tracks_title_allocations_and_excludes_host_memory() {
+        let stats = || {
+            let mut ws = WorkingSet::default();
+            assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut ws), 1);
+            ws
+        };
+
+        // Host allocations (mirrors, shader compiler) must not inflate title_used.
+        let before_host = stats();
+        let mut host_buf = vec![0u8; 32 * MIB];
+        for page in host_buf.chunks_mut(4096) {
+            page[0] = 1;
+        }
+        std::hint::black_box(&host_buf);
+        let after_host = stats();
+        assert!(
+            after_host.title_used < before_host.title_used + 16 * MIB,
+            "host memory should not be counted in title_used: before={} after={}",
+            before_host.title_used,
+            after_host.title_used
+        );
+        drop(host_buf);
+
+        // Uncommitted virtual reservations count 0; committing adds exact bytes;
+        // VirtualFree(MEM_RELEASE) subtracts them automatically.
+        let before_virt = stats();
+        let virt = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            16 * MIB,
+            MEM_RESERVE,
+            GRAPHICS,
+            PAGE_NOACCESS,
+        );
+        assert!(!virt.is_null());
+        let after_reserve = stats();
+        assert!(
+            after_reserve.title_used < before_virt.title_used + 8 * MIB,
+            "uncommitted reserve should not be counted"
+        );
+        let committed = XMemVirtualAlloc(virt, 16 * MIB, MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+        assert_eq!(committed, virt);
+        let after_commit = stats();
+        assert!(after_commit.title_used >= before_virt.title_used + 12 * MIB);
+        assert!(after_commit.gpu_optimal_used >= before_virt.gpu_optimal_used + 12 * MIB);
+        // SAFETY: our reservation from above.
+        assert_ne!(unsafe { VirtualFree(virt, 0, MEM_RELEASE) }, 0);
+        let after_release = stats();
+        assert!(after_release.title_used + 10 * MIB <= after_commit.title_used);
+        assert!(after_release.gpu_optimal_used + 10 * MIB <= after_commit.gpu_optimal_used);
+
+        // XMemAllocDefault tracks standard vs GPU-optimal allocations and frees.
+        let before_heap = stats();
+        let std_blk = XMemAllocDefault(16 * MIB, 0);
+        let gpu_blk = XMemAllocDefault(16 * MIB, 1 << ALLOC_TYPE_SHIFT);
+        assert!(!std_blk.is_null() && !gpu_blk.is_null());
+        let after_heap = stats();
+        assert!(after_heap.title_used >= before_heap.title_used + 28 * MIB);
+        assert!(after_heap.gpu_optimal_used >= before_heap.gpu_optimal_used + 12 * MIB);
+        assert!(after_heap.gpu_optimal_used < before_heap.gpu_optimal_used + 24 * MIB);
+        XMemFreeDefault(std_blk, 0);
+        XMemFreeDefault(gpu_blk, 0);
+        let after_heap_free = stats();
+        assert!(after_heap_free.title_used + 24 * MIB <= after_heap.title_used);
+        assert!(after_heap_free.gpu_optimal_used + 10 * MIB <= after_heap.gpu_optimal_used);
+
+        // Physical pages track total count, title_used, and gpu_optimal_used.
+        let before_phys = stats();
+        let mut pages = [0usize; 64];
+        let mut count = pages.len();
+        assert_eq!(
+            XMemAllocatePhysicalPages(GRAPHICS, &mut count, pages.as_mut_ptr()),
+            1
+        );
+        assert_eq!(count, 64);
+        let after_phys = stats();
+        assert!(after_phys.physical_pages >= before_phys.physical_pages + 50);
+        assert!(after_phys.gpu_optimal_used >= before_phys.gpu_optimal_used + 3 * MIB);
+        assert_eq!(XMemFreePhysicalPages(count, pages.as_ptr()), 1);
+        let after_phys_free = stats();
+        assert!(after_phys_free.physical_pages + 50 <= after_phys.physical_pages);
     }
 
     #[test]
@@ -1238,5 +1484,169 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+}
+
+/// The space below 4 GiB, which the title's 32-bit memory (`XMemVirtualAlloc`
+/// with the 32-bit address flag) has to fit in.
+const FOUR_GIB: usize = 1 << 32;
+
+/// Guards over the space below 4 GiB. Windows places allocations bottom up,
+/// so the host's own memory (the driver's, heaps, the shader and pipeline
+/// caches read at startup) filled it first: with a large pipeline cache only
+/// 22 MB was left, in pieces, when Grand Theft Auto VI asked for a 185 MB
+/// 32-bit placeholder at startup, the request was refused
+/// (`ERROR_NOT_ENOUGH_MEMORY`) and the title stopped at an assertion. The
+/// debug layer's memory did the same. So the free space below 4 GiB is
+/// reserved at startup, past [`low_guards::SLACK`] left for the host, and a
+/// 32-bit request that finds no room releases guards and tries again.
+pub mod low_guards {
+    use std::sync::Mutex;
+
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualAlloc,
+        VirtualFree, VirtualQuery,
+    };
+
+    use super::FOUR_GIB;
+
+    /// Free space left to the host below 4 GiB (the lowest free space).
+    pub(crate) const SLACK: usize = 256 << 20;
+    /// The allocation granularity of Windows.
+    const GRANULE: usize = 64 << 10;
+
+    /// The guards, `(base, bytes)`.
+    static GUARDS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+    fn guards() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+        GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The free runs in `[from, to)`, granule-aligned.
+    fn free_runs(from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        let mut at = from.max(GRANULE);
+        while at < to {
+            // SAFETY: plain data filled in by the query.
+            let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            if unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } == 0 {
+                break;
+            }
+            let base = m.BaseAddress as usize;
+            let end = (base + m.RegionSize).min(to);
+            if m.State == MEM_FREE {
+                let (start, end) = (
+                    base.max(from).next_multiple_of(GRANULE),
+                    end & !(GRANULE - 1),
+                );
+                if end > start {
+                    runs.push((start, end - start));
+                }
+            }
+            at = base + m.RegionSize;
+        }
+        runs
+    }
+
+    /// Reserves `[base, base + bytes)` as a guard; false if something took it.
+    fn guard(base: usize, bytes: usize) -> bool {
+        // SAFETY: a reservation of free address space; nothing refers to it.
+        let at = unsafe { VirtualAlloc(base as *const _, bytes, MEM_RESERVE, PAGE_NOACCESS) };
+        at as usize == base
+    }
+
+    /// Reserves the free space below 4 GiB but the lowest [`SLACK`]. Call
+    /// once, before the host allocates much (the GPU device, the caches).
+    pub fn install() {
+        let mut guards = guards();
+        let mut slack = SLACK;
+        for (mut base, mut bytes) in free_runs(0, FOUR_GIB) {
+            let left = slack.min(bytes);
+            (base, bytes, slack) = (base + left, bytes - left, slack - left);
+            if bytes > 0 && guard(base, bytes) {
+                guards.push((base, bytes));
+            }
+        }
+        let total: usize = guards.iter().map(|g| g.1).sum();
+        tracing::info!(
+            guards = guards.len(),
+            mb = total >> 20,
+            "space below 4 GiB kept for the title"
+        );
+    }
+
+    /// Releases a guard of at least `bytes` (the largest if none is that
+    /// big, so the request may fit in what it joins); what was released,
+    /// or `None` if there are no guards left.
+    pub(crate) fn release(bytes: usize) -> Option<(usize, usize)> {
+        let mut guards = guards();
+        let i = guards
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.1 >= bytes)
+            .min_by_key(|(_, g)| g.1)
+            .or_else(|| guards.iter().enumerate().max_by_key(|(_, g)| g.1))?
+            .0;
+        let (base, size) = guards.swap_remove(i);
+        // SAFETY: our own reservation, nothing inside it.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        Some((base, size))
+    }
+
+    /// Guards again what is still free of a released guard.
+    pub(crate) fn reguard((base, bytes): (usize, usize)) {
+        let mut guards = guards();
+        for (start, size) in free_runs(base, base + bytes) {
+            if guard(start, size) {
+                guards.push((start, size));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A released guard is guarded again around what took part of it.
+        #[test]
+        fn a_released_guard_is_guarded_again_around_what_took_it() {
+            // A known hole of four granules: reserved, then freed.
+            // SAFETY: a fresh reservation, released at once.
+            let hole =
+                unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
+                    as usize;
+            assert_ne!(hole, 0);
+            // SAFETY: ours.
+            unsafe { VirtualFree(hole as *mut _, 0, MEM_RELEASE) };
+            assert!(guard(hole, 4 * GRANULE));
+            guards().push((hole, 4 * GRANULE));
+            let mut others = Vec::new();
+            let released = loop {
+                let r = release(4 * GRANULE).expect("a guard");
+                if r.0 == hole {
+                    break r;
+                }
+                others.push(r);
+            };
+            for (b, n) in others {
+                assert!(guard(b, n));
+                guards().push((b, n));
+            }
+            // Something takes the first granule; the rest is guarded again.
+            // SAFETY: free address space just released.
+            let taken =
+                unsafe { VirtualAlloc(hole as *const _, GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
+                    as usize;
+            assert_eq!(taken, hole);
+            reguard(released);
+            assert!(guards().contains(&(hole + GRANULE, 3 * GRANULE)));
+            guards().retain(|&(b, _)| b != hole + GRANULE);
+            // SAFETY: ours.
+            unsafe {
+                VirtualFree(taken as *mut _, 0, MEM_RELEASE);
+                VirtualFree((hole + GRANULE) as *mut _, 0, MEM_RELEASE);
+            }
+        }
     }
 }
