@@ -103,22 +103,15 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
+        } else if count + DYNAMIC <= PORTABLE_VIEWS && let Ok(heap) = make(count + DYNAMIC) {
             (heap, count, DYNAMIC)
+        } else if count + MIN_DYNAMIC <= PORTABLE_VIEWS && let Ok(heap) = make(count + MIN_DYNAMIC) {
+            (heap, count, MIN_DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
-            }
+            // shortcut: descriptors past the host's limit are left
+            // out; a title that reaches them needs remapping.
+            tracing::warn!(count, "host view heap capped at {PORTABLE_VIEWS}");
+            (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS.saturating_sub(MIN_DYNAMIC), MIN_DYNAMIC)
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -972,5 +965,17 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A large requested descriptor count is capped at PORTABLE_VIEWS
+    /// rather than creating a heap that violates D3D12 limits (#735).
+    #[test]
+    fn large_view_heap_is_capped_at_portable_limit() {
+        if host().is_none() {
+            return;
+        }
+        if let Some(heap) = HostHeap::new(false, 1_048_576) {
+            assert!(heap.count + heap.dynamic <= PORTABLE_VIEWS);
+        }
     }
 }
