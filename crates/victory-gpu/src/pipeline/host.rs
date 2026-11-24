@@ -983,10 +983,7 @@ mod tests {
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
     }
-}
 
-#[cfg(test)]
-mod tests {
     use super::{dxil_wave_lanes, wave_lanes_unsupported};
 
     fn synthetic_dxbc_with_psv0(min_lanes: u32, max_lanes: u32) -> Vec<u8> {
