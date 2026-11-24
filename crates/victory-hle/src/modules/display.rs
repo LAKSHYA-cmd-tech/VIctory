@@ -100,9 +100,15 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     // SAFETY: the request we just created.
     if unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) } == 0 {
         let hr = last_error();
-        // SAFETY: as above; not handed out.
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
-        return hr;
+        // Headless, VM, and RDP environments without an active display request
+        // path report ERROR_NOT_SUPPORTED (0x80070032); still hand out the
+        // valid request handle so the title does not fail (#727).
+        const NOT_SUPPORTED_HR: i32 = -2147024846; // 0x80070032
+        if hr != NOT_SUPPORTED_HR {
+            // SAFETY: as above; not handed out.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
+            return hr;
+        }
     }
     put(out, request)
 }
