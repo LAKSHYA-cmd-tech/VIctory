@@ -65,15 +65,16 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
-/// Textures the host GPU wrote by a copy or resolve: their contents are on
-/// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+/// Textures the host GPU wrote by a copy or resolve, with the watch
+/// asking tick when the write happened.
+static HOST_WRITTEN: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let tick = crate::watch::current_tick();
+    map.get_or_insert_with(Default::default)
+        .insert(resource as usize, tick);
 }
 
 /// The title released a resource.
@@ -82,9 +83,9 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = map.as_mut() {
+        map.remove(&resource);
     }
 }
 
@@ -101,19 +102,31 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
+    let host_write_tick = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+        .and_then(|map| map.get(&(resource as usize)).copied());
+    if !list.first_use(resource as usize) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
         return;
     };
+    if let Some(tick) = host_write_tick {
+        let size = staging.layout.size as usize;
+        let start = staging.memory as usize;
+        let title_updated = crate::watch::writes(start, start + size, false)
+            .is_some_and(|(_, written)| written.iter().any(|&(_, w)| w > tick));
+        if title_updated {
+            let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(map) = map.as_mut() {
+                map.remove(&(resource as usize));
+            }
+        } else {
+            return;
+        }
+    }
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
