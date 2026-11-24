@@ -22,6 +22,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+/// A heap handle's block, load, first dword, sampler heap and properties.
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -39,6 +42,9 @@ pub(crate) struct Lowered {
     pub stride_table: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Each heap handle's resource properties, in creation order.
+    #[cfg(test)]
+    pub heap_props: Vec<(u32, u32)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -172,7 +178,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<HandleKey, V>,
     /// Runtime stride table entries read in a block, by the descriptor's
     /// load: the raw slot, the stride and the bias.
     entries: HashMap<(usize, Site, u8), [V; 3]>,
@@ -929,6 +935,8 @@ impl<'a> Lower<'a> {
             root_srvs,
             address_srvs: self.address_views,
             stride_table,
+            #[cfg(test)]
+            heap_props: std::mem::take(&mut self.s.heap_props),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3572,7 +3580,9 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                // Keyed by both property words: one descriptor can be read
+                // as f32 x4 (a size query) and as u32 (an atomic).
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -7333,7 +7343,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -7372,6 +7382,57 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    /// Root parameter `slot` in user SGPRs from `user_data` on.
+    fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
+        RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: if root == RootType::Descriptor { 2 } else { 1 },
+            base_register: 0,
+            user_data,
+            slot,
+        }
+    }
+
+    /// Lowers a compute program with the root parameters `layout` (in user
+    /// SGPRs from s0 on) and the used resources `used`.
+    fn lower_with(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout,
+            used,
+            io: StageIo::Cs(ComputeIo {
+                // The layout's user SGPRs (at least two), 512 bytes of LDS.
+                rsrc2: 1 << 15 | sgprs.max(2) << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
     }
 
     #[test]
@@ -7486,6 +7547,43 @@ mod tests {
             perm_features(256) & 0x8000,
             0,
             "dynamic v_perm_b32 must not require INT64"
+        );
+    }
+
+    #[test]
+    fn an_image_atomic_after_a_size_query_gets_an_integer_handle() {
+        // A size query, then an atomic on the same image UAV: the float
+        // handle of the query must not be reused for the u32 atomic
+        // (dxil-spirv then declares a float image: OpAtomicUMax %float).
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0x7E02_0300, // v_mov_b32 v1, v0
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xF038_0308,
+            0x0002_0200, // image_get_resinfo v[2:3], v0, s[8:15] dmask:0x3 dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF05C_0108,
+            0x0002_0200, // image_atomic_umax v2, v[0:1], s[8:15] dmask:0x1 dim:2D
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used).unwrap();
+        // The query's f32 x4 handle and the atomic's own u32 x1 one.
+        assert_eq!(
+            l.heap_props.iter().map(|p| p.1).collect::<Vec<_>>(),
+            [0x409, 0x105]
         );
     }
 
