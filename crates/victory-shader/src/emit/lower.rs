@@ -34,8 +34,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Bit n: immediate sampler n is used for comparisons.
-    pub cmp_samplers: u64,
+    /// Whether immediate sampler `n` is used for comparisons.
+    pub cmp_samplers: Vec<bool>,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub address_srvs: Vec<AddressView>,
@@ -183,7 +183,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
-    samplers: Vec<[u32; 4]>,
+    samplers: Vec<([u32; 4], bool)>,
     /// Root SRVs at addresses in root constants, in the order of the
     /// shader's `address_srvs`.
     address_views: Vec<AddressView>,
@@ -2121,11 +2121,11 @@ impl<'a> Lower<'a> {
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
-        self.s.samplers = self.samplers.len() as u32;
+        let (samplers, cmp_samplers): (Vec<_>, Vec<_>) = self.samplers.into_iter().unzip();
+        self.s.samplers = cmp_samplers.clone();
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let stride_table = self.s.stride_table.is_some();
-        let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -2136,7 +2136,7 @@ impl<'a> Lower<'a> {
             heap_props: std::mem::take(&mut self.s.heap_props),
             dxil: self.s.finish(),
             user_data,
-            samplers: self.samplers,
+            samplers,
         })
     }
 
@@ -5048,19 +5048,16 @@ impl<'a> Lower<'a> {
 
     /// The handle of the immediate sampler `words` (a static sampler).
     fn immediate_sampler(&mut self, words: [u32; 4], props: (u32, u32)) -> Result<V, Why> {
-        let n = match self.samplers.iter().position(|w| *w == words) {
+        let comparison = props.0 & 0x8000 != 0;
+        let key = (words, comparison);
+        let n = match self.samplers.iter().position(|s| *s == key) {
             Some(n) => n,
             None => {
-                self.samplers.push(words);
+                self.samplers.push(key);
                 self.samplers.len() - 1
             }
         };
-        if props.0 & 0x8000 != 0 {
-            // shortcut: one sampler used with and without comparison
-            // would need two static samplers; it becomes a comparison one.
-            self.s.cmp_samplers |= 1 << n;
-        }
-        Ok(self.s.sampler_handle(self.cur, n as u32))
+        Ok(self.s.sampler_handle(self.cur, n as u32, comparison))
     }
 
     /// The handles of the sampler `src` read at `site`, and which one each
