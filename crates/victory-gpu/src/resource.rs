@@ -447,6 +447,17 @@ pub(crate) extern "system" fn copyable_footprints(
     }
 }
 
+const INVALID_ALLOCATION: AllocationInfo = AllocationInfo {
+    size: u64::MAX,
+    alignment: 0,
+};
+
+const INVALID_ALLOCATION1: AllocationInfo1 = AllocationInfo1 {
+    offset: u64::MAX,
+    alignment: 0,
+    size: u64::MAX,
+};
+
 /// Device method: the footprint of resources placed one after another.
 /// Returns a 16-byte value, through a hidden first argument. Invalid input
 /// gives the documented size `u64::MAX`.
@@ -457,14 +468,20 @@ pub(crate) extern "system" fn allocation_info(
     count: u32,
     descs: *const ResourceDesc,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
+    let total = if count == 0 {
+        place(std::iter::empty(), |_, _| ())
+    } else if descs.is_null() {
+        INVALID_ALLOCATION
     } else {
-        // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        // SAFETY: `count` is non-zero and `descs` is checked non-null; the
+        // title passes `count` descriptions.
+        let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+        place(descs.iter(), |_, _| ())
     };
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(place(descs.iter(), |_, _| ())) };
+    // SAFETY: the caller passes room for the value (null is tolerated).
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = total;
+    }
     out
 }
 
@@ -479,6 +496,7 @@ const _: () = assert!(size_of::<ResourceDesc1>() == 72);
 
 /// Where one resource goes in [`allocation_info2`]'s placement.
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AllocationInfo1 {
     offset: u64,
     alignment: u64,
@@ -495,51 +513,55 @@ pub(crate) extern "system" fn allocation_info2(
     descs: *const ResourceDesc1,
     each: *mut AllocationInfo1,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
+    let total = if count == 0 {
+        place(std::iter::empty(), |_, _| ())
+    } else if descs.is_null() {
+        INVALID_ALLOCATION
     } else {
-        // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        // SAFETY: `count` is non-zero and `descs` is checked non-null; the
+        // title passes `count` descriptions.
+        let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+        place(descs.iter().map(|d| &d.desc), |i, info| {
+            if !each.is_null() {
+                // SAFETY: the title passes room for `count` entries.
+                unsafe { each.add(i).write(info) };
+            }
+        })
     };
-    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
-        if !each.is_null() {
-            // SAFETY: the title passes room for `count` entries.
-            unsafe { each.add(i).write(info) };
-        }
-    });
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(total) };
+    // SAFETY: the caller passes room for the value (null is tolerated).
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = total;
+    }
     out
 }
 
 /// Resources placed one after another: the whole footprint, telling `each`
-/// where every resource goes. Unknown sizes give the documented `u64::MAX`.
+/// where every resource goes. Unknown or overflowing sizes give the
+/// documented `u64::MAX`.
 fn place<'a>(
     descs: impl Iterator<Item = &'a ResourceDesc>,
     mut each: impl FnMut(usize, AllocationInfo1),
 ) -> AllocationInfo {
     let mut total = AllocationInfo {
         size: 0,
-        alignment: KIB_64,
+        alignment: 1,
     };
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
             tracing::warn!(?desc, "no size for this resource");
-            each(
-                i,
-                AllocationInfo1 {
-                    offset: u64::MAX,
-                    alignment: 0,
-                    size: u64::MAX,
-                },
-            );
-            return AllocationInfo {
-                size: u64::MAX,
-                alignment: 0,
-            };
+            each(i, INVALID_ALLOCATION1);
+            return INVALID_ALLOCATION;
+        };
+        let Some((offset, size)) = total
+            .size
+            .checked_next_multiple_of(one.alignment)
+            .and_then(|offset| offset.checked_add(one.size).map(|size| (offset, size)))
+        else {
+            tracing::warn!(?desc, total = total.size, ?one, "allocation size overflows");
+            each(i, INVALID_ALLOCATION1);
+            return INVALID_ALLOCATION;
         };
         tracing::debug!(?desc, ?one, "allocation info");
-        let offset = total.size.next_multiple_of(one.alignment);
         each(
             i,
             AllocationInfo1 {
@@ -548,7 +570,7 @@ fn place<'a>(
                 size: one.size,
             },
         );
-        total.size = offset + one.size;
+        total.size = size;
         total.alignment = total.alignment.max(one.alignment);
     }
     total
@@ -711,11 +733,13 @@ extern "system" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HR
 extern "system" fn heap_release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn heap_desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
     if !out.is_null() {
         // SAFETY: `this` is a heap; the title passes room for a description.
         unsafe { out.write((*this.cast::<Heap>()).desc) };
     }
+    out
 }
 
 /// A resource's memory: its own, or a range of a heap it holds a reference
@@ -746,9 +770,37 @@ struct Resource {
     heap_flags: u32,
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// yet. Made on first use (a view, a target, a copy, a barrier), not
+    /// at creation: a texture the title makes and never has the GPU use
+    /// costs no host memory (the world makes thousands; their host copies
+    /// took about 9 GB, past an 8 GB card's budget, 2026-11-24).
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    /// The creation state and clear value the host copy is made with.
+    #[cfg(windows)]
+    made_with: (u32, Option<[u32; 5]>),
+}
+
+#[cfg(windows)]
+impl Resource {
+    /// The host copy, made now if this is its first use.
+    fn host(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        self.host
+            .get_or_init(|| {
+                let (state, clear) = self.made_with;
+                let clear = clear
+                    .as_ref()
+                    .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+                let texture = host_texture(&self.desc, state, clear)?;
+                let state =
+                    crate::host::legal_state(&texture, crate::host::texture_state(state));
+                Some(std::sync::Arc::new(HostTexture {
+                    texture,
+                    state: state.into(),
+                }))
+            })
+            .as_ref()
+    }
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -768,7 +820,7 @@ pub(crate) struct HostTexture {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = resource(this).host()?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -783,7 +835,7 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).host().map(|h| &h.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -792,7 +844,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    resource(this).host().cloned()
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -817,12 +869,26 @@ fn host_texture(
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
     // shortcut: the host copy loses UAV use; give it a second view-only
     // copy if draws write it as a UAV.
+    const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    // Formats without host UAV or render-target capability (the console
+    // allows both; host D3D12 removes the device on invalid flag combinations, #735).
+    // B5G5R5A1 (86) and B5G6R5 (85) have no typed UAV support; B4G4R4A4 (115)
+    // has no render-target support; block-compressed formats have neither.
+    if matches!(d.format, 85 | 86) {
+        d.flags &= !UNORDERED;
+    }
+    if d.format == 115 {
+        d.flags &= !RENDER_TARGET;
+    }
+    if element(d.format).is_some_and(|(_, w)| w > 1) {
+        d.flags &= !(RENDER_TARGET | DEPTH | UNORDERED);
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -927,8 +993,13 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
+    // The clear value is the caller's only during the call.
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    let made_with = (
+        state,
+        // SAFETY: the title passes a whole clear value (5 words) or null.
+        (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
+    );
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -936,13 +1007,9 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-            })
-        }),
+        host: std::sync::OnceLock::new(),
+        #[cfg(windows)]
+        made_with,
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -958,7 +1025,8 @@ impl Drop for Resource {
         #[cfg(feature = "diagnostics")]
         if self
             .host
-            .as_ref()
+            .get()
+            .and_then(Option::as_ref)
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -972,6 +1040,10 @@ impl Drop for Resource {
                     "a title texture was released while a list not yet reset names its host copy"
                 );
             }
+        }
+        // A running submission may still read the host copy.
+        if let Some(host) = self.host.take().flatten() {
+            crate::host::retire(host);
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
@@ -1174,7 +1246,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    resource(out).host().is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1246,11 +1318,13 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
     S_OK
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
-extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) -> *mut ResourceDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(resource(this).desc) };
     }
+    out
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
 /// hidden first argument: what a standard heap type is as a custom heap.
@@ -1416,9 +1490,12 @@ mod tests {
         let memory = unsafe { &(*heap.cast::<Heap>()).memory };
         assert_eq!(memory.ptr.as_ptr() as u64 % KIB_64, 0);
         let mut back = std::mem::MaybeUninit::<HeapDesc>::uninit();
-        slot::<extern "system" fn(This, *mut HeapDesc)>(heap, 0x40)(heap, back.as_mut_ptr());
+        type GetDesc = extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc;
+        let get_desc = slot::<GetDesc>(heap, 0x40);
+        assert_eq!(get_desc(heap, back.as_mut_ptr()), back.as_mut_ptr());
         // SAFETY: written above.
         assert_eq!(unsafe { back.assume_init() }.size, 1 << 20);
+        assert!(get_desc(heap, std::ptr::null_mut()).is_null());
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
 
         let bad = HeapDesc {
@@ -1558,6 +1635,229 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    #[test]
+    fn allocation_info_keeps_console_alignments_and_checks_bounds() {
+        let device = crate::device::device();
+        type GetInfo = extern "system" fn(
+            *mut AllocationInfo,
+            This,
+            u32,
+            u32,
+            *const ResourceDesc,
+        ) -> *mut AllocationInfo;
+        type GetInfo2 = extern "system" fn(
+            *mut AllocationInfo,
+            This,
+            u32,
+            u32,
+            *const ResourceDesc1,
+            *mut AllocationInfo1,
+        ) -> *mut AllocationInfo;
+        let get_info = slot::<GetInfo>(device, 0xc8);
+        let get_info2 = slot::<GetInfo2>(device, 0x360);
+        let desc1 = |desc| ResourceDesc1 {
+            desc,
+            mip_region: [0; 3],
+        };
+
+        // Single 4 KiB-swizzled texture keeps its 4 KiB alignment instead of
+        // being rounded up to 64 KiB.
+        let bc7 = texture(512, 512, 98, 10);
+        let mut info = AllocationInfo {
+            size: 0,
+            alignment: 0,
+        };
+        let ret = get_info(&mut info, device, 0, 1, &bc7);
+        assert_eq!(ret, &raw mut info);
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0x56000,
+                alignment: 0x1000,
+            }
+        );
+
+        // Linear textures keep their 256-byte alignment too.
+        let linear = ResourceDesc {
+            layout: 1,
+            ..texture(100, 60, 28, 1)
+        };
+        let linear_expected = footprint(&linear).unwrap();
+        assert_eq!(linear_expected.alignment, 256);
+        get_info(&mut info, device, 0, 1, &linear);
+        assert_eq!(info, linear_expected);
+
+        // Two 4 KiB textures via GetResourceAllocationInfo2 agree between the
+        // per-resource info and the returned total alignment.
+        let two = [desc1(bc7), desc1(bc7)];
+        let mut each = [AllocationInfo1 {
+            offset: 0,
+            alignment: 0,
+            size: 0,
+        }; 2];
+        let ret = get_info2(&mut info, device, 0, 2, two.as_ptr(), each.as_mut_ptr());
+        assert_eq!(ret, &raw mut info);
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 2 * 0x56000,
+                alignment: 0x1000,
+            }
+        );
+        assert_eq!(
+            each,
+            [
+                AllocationInfo1 {
+                    offset: 0,
+                    alignment: 0x1000,
+                    size: 0x56000,
+                },
+                AllocationInfo1 {
+                    offset: 0x56000,
+                    alignment: 0x1000,
+                    size: 0x56000,
+                },
+            ]
+        );
+
+        // Mixing 4 KiB and 64 KiB resources still raises total alignment to the
+        // maximum and aligns the second resource to 64 KiB.
+        let mixed = [desc1(bc7), desc1(buffer(100))];
+        get_info2(&mut info, device, 0, 2, mixed.as_ptr(), each.as_mut_ptr());
+        assert_eq!(
+            each,
+            [
+                AllocationInfo1 {
+                    offset: 0,
+                    alignment: 0x1000,
+                    size: 0x56000,
+                },
+                AllocationInfo1 {
+                    offset: 0x60000,
+                    alignment: KIB_64,
+                    size: KIB_64,
+                },
+            ]
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0x70000,
+                alignment: KIB_64,
+            }
+        );
+
+        // Empty query returns { size: 0, alignment: 1 }, matching host D3D12.
+        get_info(&mut info, device, 0, 0, std::ptr::null());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0,
+                alignment: 1,
+            }
+        );
+        get_info2(
+            &mut info,
+            device,
+            0,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0,
+                alignment: 1,
+            }
+        );
+
+        // Non-zero count with a null descriptor pointer reports failure.
+        get_info(&mut info, device, 0, 1, std::ptr::null());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0,
+            }
+        );
+        get_info2(
+            &mut info,
+            device,
+            0,
+            1,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0,
+            }
+        );
+
+        // Cumulative size overflow returns the documented error instead of
+        // panicking or wrapping.
+        let overflow_add = [desc1(buffer(1 << 63)), desc1(buffer(1 << 63))];
+        get_info2(
+            &mut info,
+            device,
+            0,
+            2,
+            overflow_add.as_ptr(),
+            each.as_mut_ptr(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0,
+            }
+        );
+        assert_eq!(
+            each[1],
+            AllocationInfo1 {
+                offset: u64::MAX,
+                alignment: 0,
+                size: u64::MAX,
+            }
+        );
+
+        // Alignment padding overflow returns the documented error too.
+        let near_max = buffer(u64::MAX - KIB_64);
+        let small = texture(16, 16, 28, 1);
+        let overflow_align = [desc1(near_max), desc1(small), desc1(buffer(KIB_64))];
+        let mut each3 = [AllocationInfo1 {
+            offset: 0,
+            alignment: 0,
+            size: 0,
+        }; 3];
+        get_info2(
+            &mut info,
+            device,
+            0,
+            3,
+            overflow_align.as_ptr(),
+            each3.as_mut_ptr(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0,
+            }
+        );
+        assert_eq!(
+            each3[2],
+            AllocationInfo1 {
+                offset: u64::MAX,
+                alignment: 0,
+                size: u64::MAX,
+            }
+        );
     }
 
     #[test]
@@ -1798,6 +2098,14 @@ mod tests {
             &mut committed,
         );
         assert_eq!(hr, S_OK);
+        let mut back = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+        type GetDesc = extern "system" fn(This, *mut ResourceDesc) -> *mut ResourceDesc;
+        let get_desc = slot::<GetDesc>(committed, 0x50);
+        assert_eq!(get_desc(committed, back.as_mut_ptr()), back.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { back.assume_init() };
+        assert_eq!((read.dimension, read.width), (BUFFER, 256));
+        assert!(get_desc(committed, std::ptr::null_mut()).is_null());
         let mut data = std::ptr::null_mut();
         assert_eq!(
             slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data),
@@ -1840,5 +2148,26 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// Formats without host UAV or RTV support clear those flags (#735).
+    #[test]
+    fn incompatible_host_texture_flags_are_cleared() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        // B5G5R5A1 with UAV
+        let b5g5r5a1 = texture(64, 64, 86, 1);
+        let mut desc = b5g5r5a1;
+        desc.flags = 4; // UNORDERED
+        let res = host_texture(&desc, 0, std::ptr::null());
+        assert!(res.is_some(), "B5G5R5A1 texture creation succeeded without UAV");
+
+        // B4G4R4A4 with RenderTarget
+        let b4g4r4a4 = texture(64, 64, 115, 1);
+        let mut desc2 = b4g4r4a4;
+        desc2.flags = 1; // RENDER_TARGET
+        let res2 = host_texture(&desc2, 0, std::ptr::null());
+        assert!(res2.is_some(), "B4G4R4A4 texture creation succeeded without RenderTarget");
     }
 }
