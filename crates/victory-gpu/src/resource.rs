@@ -233,6 +233,9 @@ pub(crate) fn pc_format(format: u32) -> u32 {
         118 => 45,
         119 => 46,
         120 => 47,
+        // Stand-in formats for render target and UAV creation on host drivers.
+        85 | 86 | 115 => 28, // B5G6R5 / B5G5R5A1 / B4G4R4A4 -> R8G8B8A8_UNORM
+        67 => 10,            // R9G9B9E5_SHAREDEXP -> R16G16B16A16_FLOAT
         other => other,
     }
 }
@@ -2266,5 +2269,11 @@ mod tests {
 
         assert!(!is_typeless(87));
         assert_eq!(first_concrete(87), 87);
+
+        assert_eq!(pc_format(85), 28);
+        assert_eq!(pc_format(86), 28);
+        assert_eq!(pc_format(115), 28);
+        assert_eq!(pc_format(67), 10);
+        assert_eq!(pc_format(28), 28);
     }
 }
