@@ -23,7 +23,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{BUFFER_READ, BUFFER_WRITE, HostList, host};
 
 pub(crate) const DRAW: u32 = 0;
 pub(crate) const INDEXED: u32 = 1;
@@ -211,30 +211,36 @@ pub(crate) fn bound(
     gpu: u64,
     spec: (u32, u32, u32, u32),
 ) -> bool {
-    if !clamp_uav(list, gpu, spec) {
-        return false;
-    }
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        )]);
-    }
-    true
+    list.buffer_state(buffer, BUFFER_WRITE);
+    clamp_uav(list, gpu, spec)
 }
 
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
+/// Runs `max` records of `signature` from `args` (a host copy of title
+/// memory) at `offset`, with their count at `counter` if there is one: both
+/// read as arguments, after whatever wrote them (the clamp, or the draw's
+/// own binding).
+pub(crate) fn execute(
+    list: &HostList,
+    signature: &ID3D12CommandSignature,
+    max: u32,
+    (args, offset): (&ID3D12Resource, u64),
+    counter: Option<(&ID3D12Resource, u64)>,
+) {
+    list.buffer_state(args, BUFFER_READ);
+    if let Some((c, _)) = counter {
+        list.buffer_state(c, BUFFER_READ);
+    }
+    // SAFETY: an open list with everything set; host copies the list keeps
+    // alive, a cached signature.
     unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
+        list.list.ExecuteIndirect(
+            signature,
+            max,
+            args,
+            offset,
+            counter.map(|(c, _)| c),
+            counter.map_or(0, |(_, at)| at),
+        )
     };
 }
 

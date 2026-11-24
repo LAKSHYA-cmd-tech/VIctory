@@ -150,6 +150,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -440,6 +441,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -458,6 +461,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1319,7 +1323,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1343,17 +1346,13 @@ impl State {
         }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), and the signature is live.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
-        indirect::done(list, &args.buffer);
+        crate::indirect::execute(
+            list,
+            &signature,
+            max,
+            (&args.buffer, args.offset(arguments)),
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+        );
         // ExecuteIndirect zeroes the constants it sets. Mirror that in
         // the title state so the next bind doesn't restore stale values.
         for &[_, slot, dest, dwords] in &guest_args[..guest_args.len() - 1] {
@@ -1576,6 +1575,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         }
     }
     match (view, u.kind) {
