@@ -959,11 +959,31 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
+/// Records a global UAV barrier on `this`'s host list so earlier shader
+/// writes finish before later GPU work starts.
+fn wait_for_shader_writes(this: This) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        // SAFETY: `Barrier` matches `D3D12_RESOURCE_BARRIER` in layout, and
+        // `UAV_BARRIER` names no resource (`first` is null).
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        // SAFETY: `list.list` is an open host command list.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
+
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. Within a single
+/// command list, earlier shader writes must finish before later dispatches
+/// or draws read or write the same resources, so record a UAV barrier on
+/// the host list.
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    wait_for_shader_writes(this);
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1347,19 +1367,9 @@ extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _referen
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    #[cfg(windows)]
-    if count > 0
-        && let Some(list) = host_list(this)
-    {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: the same layout; no resource named.
-        let barrier =
-            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    if count > 0 {
+        wait_for_shader_writes(this);
     }
-    #[cfg(not(windows))]
-    let _ = (this, count);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -1659,5 +1669,62 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    fn non_host_list(newer: bool) -> This {
+        let table = if newer {
+            &NEWER_LIST_FUNCTIONS
+        } else {
+            &LIST_FUNCTIONS
+        };
+        Box::into_raw(Box::new(List {
+            object: Object::new(table),
+            kind: 0,
+            put: [0; 5],
+            reserved: [0; 64],
+            graphics_root_headers: [0; 128],
+            compute_root_headers: [0; 128],
+            pipeline_shadow: [0; 8],
+            newer: [0; 256],
+            uploads: Default::default(),
+            #[cfg(windows)]
+            host: None,
+            #[cfg(windows)]
+            state: Default::default(),
+        }))
+        .cast()
+    }
+
+    #[test]
+    fn sync_is_safe_on_null_and_non_host_lists() {
+        type SyncFn = extern "system" fn(This, u32, u32, u64, u64);
+        type BarrierGroupsFn = extern "system" fn(This, u32, *const u8);
+
+        let base = list_table(false);
+        assert_eq!(base[129], sync as *const ());
+        assert_eq!(base[130], sync as *const ());
+        let newer = list_table(true);
+        assert_eq!(newer[131], sync as *const ());
+        assert_eq!(newer[132], sync as *const ());
+        assert_eq!(newer[146], barrier_groups as *const ());
+
+        sync(std::ptr::null(), 1, 2, 0x1000, 64);
+        barrier_groups(std::ptr::null(), 1, std::ptr::null());
+
+        for (is_newer, slots) in [(false, [129usize, 130]), (true, [131usize, 132])] {
+            let list = non_host_list(is_newer);
+            for slot_index in slots {
+                let offset = slot_index * size_of::<*const ()>();
+                slot::<SyncFn>(list, offset)(list, 0, 0, 0, 0);
+                slot::<SyncFn>(list, offset)(list, 0x3, 0x1, 0xdead_beef, 256);
+            }
+            if is_newer {
+                let offset = 146 * size_of::<*const ()>();
+                slot::<BarrierGroupsFn>(list, offset)(list, 0, std::ptr::null());
+                slot::<BarrierGroupsFn>(list, offset)(list, 1, std::ptr::null());
+            }
+            let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            assert_eq!(release(list), 0);
+        }
     }
 }
