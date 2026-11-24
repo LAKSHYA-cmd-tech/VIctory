@@ -2259,5 +2259,4 @@ mod tests {
         assert!(!is_typeless(87));
         assert_eq!(first_concrete(87), 87);
     }
-    }
 }
