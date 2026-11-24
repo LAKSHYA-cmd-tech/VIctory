@@ -149,6 +149,9 @@ pub(crate) struct Shader {
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
     pub stride_table: Option<V>,
     pub flags: u64,
+    /// Each heap handle's resource properties, in creation order.
+    #[cfg(test)]
+    pub heap_props: Vec<(u32, u32)>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -204,6 +207,8 @@ impl Shader {
             address_srvs: Vec::new(),
             stride_table: None,
             flags: 0,
+            #[cfg(test)]
+            heap_props: Vec::new(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -417,6 +422,8 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        #[cfg(test)]
+        self.heap_props.push(props);
         let (s, n) = (self.m.bool(sampler), self.m.bool(false));
         let h = self.op(
             block,
