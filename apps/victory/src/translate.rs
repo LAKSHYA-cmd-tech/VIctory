@@ -69,6 +69,14 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// The same for the halves of merged ES-GS stages (ES: vertex programs
+    /// that feed a geometry program).
+    es_programs: usize,
+    es_emitted: usize,
+    es_validated: usize,
+    gs_programs: usize,
+    gs_emitted: usize,
+    gs_validated: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -130,6 +138,12 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.es_programs += other.es_programs;
+        self.es_emitted += other.es_emitted;
+        self.es_validated += other.es_validated;
+        self.gs_programs += other.gs_programs;
+        self.gs_emitted += other.gs_emitted;
+        self.gs_validated += other.gs_validated;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -270,6 +284,11 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    println!(
+        "             {} emitted of {} geometry programs; {} validated ({} of {} \
+         ES halves emitted, {} validated)",
+        t.gs_emitted, t.gs_programs, t.gs_validated, t.es_emitted, t.es_programs, t.es_validated
+    );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -333,11 +352,7 @@ fn translate(
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
-                // Per-lane descriptors are traced on the per-lane form; its
-                // failure is listed after the resources' and I/O's.
-                let structured = structure::structure(&program);
-                let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                let res = match resource::track(&program, &p.layout, p.stage) {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
                         Some(r)
@@ -355,8 +370,9 @@ fn translate(
                 };
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
+                let geometry = matches!(p.stage, HwStage::Es | HwStage::Gs);
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || geometry || p.stage == HwStage::Ms {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
@@ -372,7 +388,7 @@ fn translate(
                         Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
                     }
                 }
-                let structured = match structured {
+                let structured = match structure::structure(&program) {
                     Ok(s) => {
                         tally_structured(&program, &s, t);
                         Some(s)
@@ -390,7 +406,15 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    let options = emit::TranslateOptions {
+                        wave64: checks
+                            .host
+                            .as_ref()
+                            .map_or(emit::Wave64Mode::Native, |(h, _)| {
+                                h.recommended_wave64_mode()
+                            }),
+                    };
+                    match emit::emit_with(&container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -437,7 +461,9 @@ fn check(
             &shader.dxil,
         );
     }
-    if let Some((h, stub_ps)) = &checks.host {
+    if let Some((h, stub_ps)) = &checks.host
+        && !matches!(shader.stage, HwStage::Es | HwStage::Gs)
+    {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
@@ -509,6 +535,19 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
             &mut t.ms_validated,
             &mut t.ms_pipelines,
         ],
+        // No pipelines yet: the last counter is a scratch one.
+        HwStage::Es => [
+            &mut t.es_programs,
+            &mut t.es_emitted,
+            &mut t.es_validated,
+            &mut t.pipelines,
+        ],
+        HwStage::Gs => [
+            &mut t.gs_programs,
+            &mut t.gs_emitted,
+            &mut t.gs_validated,
+            &mut t.pipelines,
+        ],
         _ => [
             &mut t.emit_programs,
             &mut t.emitted,
@@ -551,7 +590,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     let mut traced = HashSet::new();
     for leaf in r.descriptors.iter().flat_map(|d| d.source.leaves()) {
         let a = match *leaf {
-            resource::Source::Loaded { load, .. } | resource::Source::Fetched { load, .. } => {
+            resource::Source::Loaded { load, .. } => {
                 t.loaded += 1;
                 address(load)
             }
@@ -564,12 +603,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
-            resource::Source::Phi { .. }
-            | resource::Source::Select { .. }
-            | resource::Source::Lanes { .. }
-            | resource::Source::LanePhi { .. } => {
-                unreachable!("leaves are no phis, selects or per-lane choices")
-            }
+            resource::Source::Phi { .. } => unreachable!("leaves are no phis"),
         };
         // Heaps hold dynamic resources, which no used entry lists; code
         // tables are no root parameter.

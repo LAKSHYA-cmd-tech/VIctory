@@ -133,6 +133,33 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// The dynamic descriptor slots of a title list, if there is a host GPU.
+#[cfg(windows)]
+fn lease(this: This) -> Option<std::sync::Arc<crate::descriptor::lease::Lease>> {
+    host_list(this)?;
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+    Some(state.lease().clone())
+}
+
+/// Before a list is submitted: false if the slots of its tables were taken
+/// back after an earlier submission (a heap ran short, see
+/// [`crate::descriptor::lease`]); it must not run again until it is reset.
+/// Until [`finished`] its slots cannot be taken back.
+#[cfg(windows)]
+pub(crate) fn may_run(this: This) -> bool {
+    lease(this).is_none_or(|lease| lease.start())
+}
+
+/// After a list ran: its slots may be taken back if a heap runs short.
+#[cfg(windows)]
+pub(crate) fn finished(this: This) {
+    if let Some(lease) = lease(this) {
+        lease.finish();
+    }
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
@@ -481,9 +508,64 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// Uses the host copy when the list already wrote the footprint's buffer.
+/// Other uploads keep a separate CPU snapshot for each copy.
+#[cfg(windows)]
+fn placed_copy_source(
+    list: &crate::host::HostList,
+    resource: This,
+    offset: u64,
+    bytes: u64,
+    read: &std::ops::Range<u64>,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+
+    let data = buffer_range(resource, offset, bytes)?;
+    let address = data as u64;
+    let read_address = address + read.start;
+    let read_bytes = read.end - read.start;
+    let source = list
+        .written_shadow(read_address as usize, read_bytes as usize)
+        .and_then(|shadow| {
+            let offset = shadow.offset_for_range(address, bytes)?;
+            Some((shadow, offset))
+        });
+    let Some((shadow, offset)) = source else {
+        let (upload, staging) = list.upload(crate::host::host()?, bytes)?;
+        // Wine can report the mapped upload address as MEM_FREE.
+        list.defer_fill(staging, data, bytes as usize);
+        return Some((upload, 0));
+    };
+    let staging = if offset.is_multiple_of(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.into()) {
+        None
+    } else {
+        // A guest footprint can start at an unaligned offset in the shadow.
+        // Rebase it on the GPU so earlier writes remain visible to this copy.
+        Some(crate::host::host()?.shared_buffer(bytes)?.0)
+    };
+    shadow.refresh(list, read_address, read_bytes);
+    list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+    let Some(staging) = staging else {
+        return Some((shadow.buffer.clone(), offset));
+    };
+    list.buffer_state(&staging, COPY_DEST);
+    // SAFETY: both buffers are held by the list; the source range is checked
+    // and the staging buffer has exactly enough space for the footprint.
+    unsafe {
+        list.list.CopyBufferRegion(
+            &staging,
+            read.start,
+            &shadow.buffer,
+            offset + read.start,
+            read_bytes,
+        );
+    }
+    list.buffer_state(&staging, crate::host::BUFFER_READ);
+    Some((staging, 0))
+}
+
+/// Texture to texture on the GPU. A placed buffer source uses the host copy
+/// after a GPU write in this list, or an upload buffer filled at submission.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -512,30 +594,34 @@ extern "system" fn copy_texture_region(
             return;
         };
         let mut from = src;
-        let _upload; // keeps the source alive while this call records it
+        let _buffer; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
+        // SAFETY: the title passes source box coordinates or null.
+        let source_box = unsafe { source_box.as_ref() };
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some(bytes) = src.footprint.bytes() else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
+            let read_span = source_box
+                .and_then(|bounds| src.footprint.box_bytes(*bounds))
+                .unwrap_or(0..bytes);
+            let Some((buffer, offset)) =
+                placed_copy_source(list, src.resource, src.footprint.offset, bytes, &read_span)
+            else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = offset;
             #[cfg(feature = "diagnostics")]
             {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                // SAFETY: a live buffer; the range is inside it.
+                read = Some((
+                    unsafe { buffer.GetGPUVirtualAddress() } + offset + read_span.start,
+                    read_span.end - read_span.start,
+                ));
             }
-            _upload = buffer;
+            _buffer = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
@@ -550,7 +636,7 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let host_box = source_box.map(|bounds| std::ptr::from_ref(bounds).cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -754,8 +840,13 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                depth,
+                stencil,
+                rects,
+            )
         };
     }
     #[cfg(not(windows))]
@@ -887,7 +978,10 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Some(len) = usize::try_from(size)
+        .ok()
+        .and_then(|s| s.checked_add(align))
+    else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
@@ -900,7 +994,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
@@ -1022,6 +1119,35 @@ mod state {
             }
         });
     }
+    /// Maximum simultaneous render targets in D3D12
+    /// (`D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT`).
+    const MAX_RENDER_TARGETS: u32 = 8;
+    /// Render target view descriptor stride in bytes.
+    const RTV_STRIDE: u64 = 128;
+
+    /// Resolves `OMSetRenderTargets`'s handle arguments: ignores `handles`
+    /// when `count == 0`, caps `count` at the D3D12 limit, keeps a null
+    /// single-range start (`0`) null instead of stepping to `0x80`, and
+    /// checks single-range address arithmetic against overflow.
+    pub(super) fn target_handles(count: u32, handles: *const u64, one_range: i32) -> Vec<u64> {
+        let count = count.min(MAX_RENDER_TARGETS);
+        if count == 0 || handles.is_null() {
+            return Vec::new();
+        }
+        if one_range != 0 {
+            // SAFETY: `count > 0` and `handles` is non-null; the title passes
+            // the first handle of the contiguous range.
+            let first = unsafe { *handles };
+            if first == 0 {
+                return vec![0; count as usize];
+            }
+            return (0..u64::from(count))
+                .map(|i| first.checked_add(RTV_STRIDE * i).unwrap_or(0))
+                .collect();
+        }
+        items(handles, count).to_vec()
+    }
+
     /// `(count, handles, one range, depth)`: with one range, the handles
     /// follow the first at the render target view size (128 bytes).
     pub(super) extern "system" fn targets(
@@ -1031,13 +1157,7 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
+        let handles = target_handles(count, handles, one_range);
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
@@ -1069,8 +1189,7 @@ mod state {
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// When `indirect != 0`, executes indirect mesh dispatches.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1080,8 +1199,11 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            const MESH_ARGS: [[u32; 4]; 1] = [[10, 0, 0, 0]];
+            const STRIDE: u32 = 12;
+            with_state(this, |list, s| {
+                s.execute_indirect(list, (&MESH_ARGS, STRIDE, x.max(1)), indirect, None);
+            });
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1140,15 +1262,8 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
-/// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
-/// hold one argument each: draw (stride 16), indexed draw (20), dispatch
-/// (12), mesh dispatch (12), and the console's single-pass dispatch, type
-/// 105 (stride 12: the three group counts; its flags live in the
-/// signature, the title passes none), run as a plain dispatch. They run
-/// through the host's indirect execution (`State::execute_indirect`).
-/// shortcut: signatures that change root arguments are dropped (logged
-/// once per signature).
+/// Runs an indirect draw or dispatch with optional root constants.
+/// Unsupported signatures are dropped and logged once per signature.
 extern "system" fn execute_indirect(
     this: This,
     signature: This,
@@ -1166,14 +1281,11 @@ extern "system" fn execute_indirect(
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if let Some(address) = address
         && (count.is_null() || counter.is_some())
     {
-        const DISPATCH: u32 = 2;
-        const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (args, stride, max), address, counter);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -1241,7 +1353,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1438,10 +1551,111 @@ mod tests {
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        assert!(
+            allocate_upload(list, 8, 0x30).is_null(),
+            "not a power of two"
+        );
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
-        assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let uploads = unsafe { &(*list.cast::<List>()).uploads };
+        assert!(uploads.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn dispatch_mesh_x_routes_direct_and_indirect_dispatches() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+
+        // Direct mesh dispatch:
+        state::dispatch_mesh_x(list, 4, 0, 0, 0);
+        // Indirect mesh dispatch:
+        state::dispatch_mesh_x(list, 1, 0, 0x10000, 0);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// `OMSetRenderTargets` with `RTsSingleHandleToDescriptorRange = TRUE`:
+    /// `count == 0` must not dereference `handles`, a null first handle must
+    /// not step to `0x80`, single-range stepping must check overflow and cap
+    /// at eight render targets, and the host D3D12 runtime follows the same
+    /// rule.
+    #[cfg(windows)]
+    #[test]
+    fn om_set_render_targets_guards_empty_and_null_single_ranges() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE;
+
+        let dangling = 0x10usize as *const u64;
+        let stride = u64::from(crate::descriptor::increment_size(std::ptr::null(), 2));
+        assert_eq!(stride, 128);
+
+        assert!(state::target_handles(0, dangling, 1).is_empty());
+        assert!(state::target_handles(0, dangling, 0).is_empty());
+        assert!(state::target_handles(4, std::ptr::null(), 1).is_empty());
+        assert_eq!(state::target_handles(2, &0u64, 1), vec![0, 0]);
+        assert_eq!(
+            state::target_handles(3, &0x1000_0000u64, 1),
+            vec![0x1000_0000, 0x1000_0000 + stride, 0x1000_0000 + 2 * stride]
+        );
+        let overflow_base = u64::MAX - 64;
+        assert_eq!(
+            state::target_handles(2, &overflow_base, 1),
+            vec![overflow_base, 0]
+        );
+        assert_eq!(state::target_handles(12, &0x1000_0000u64, 1).len(), 8);
+        let explicit = [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        assert_eq!(
+            state::target_handles(10, explicit.as_ptr(), 0),
+            explicit[..8]
+        );
+
+        if let Some(host) = crate::host::host() {
+            let host_list = host.new_list().expect("host command list");
+            // Verify the real host D3D12 contract: `NumRenderTargetDescriptors = 0`
+            // ignores `pRenderTargetDescriptors` even with `one_range = true`.
+            // SAFETY: open host command list; count is 0 so the pointer is unread.
+            unsafe {
+                host_list.list.OMSetRenderTargets(
+                    0,
+                    Some(dangling.cast::<D3D12_CPU_DESCRIPTOR_HANDLE>()),
+                    true,
+                    None,
+                );
+            }
+            host_list.close();
+        }
+
+        type SetTargets = extern "system" fn(This, u32, *const u64, i32, *const u64);
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], &mut list),
+            S_OK
+        );
+        let set_targets = slot::<SetTargets>(list, 0x190);
+        // Empty single-range call with a non-null dangling pointer (e.g. depth-only pass).
+        set_targets(list, 0, dangling, 1, std::ptr::null());
+        // Single-range call whose first handle is null (0): must not step to 0x80.
+        let null_handle = 0u64;
+        set_targets(list, 2, &null_handle, 1, std::ptr::null());
+        assert_eq!(close(list), S_OK);
+
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
