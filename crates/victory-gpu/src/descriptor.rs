@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) mod lease;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -300,6 +302,7 @@ impl View {
     /// of resources or of memory) or memory the title placed a texture in:
     /// such views get host slots only for draws.
     #[cfg(windows)]
+    #[allow(dead_code)]
     fn is_buffer(&self) -> bool {
         match self {
             View::Constant(..) | View::Placed(..) => true,
