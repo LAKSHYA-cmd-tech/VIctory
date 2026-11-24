@@ -158,8 +158,12 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
+                    let count = (self.targets.NumRenderTargets as usize).min(8);
+                    for f in &mut self.targets.RTFormats[..count] {
                         f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+                    }
+                    for f in &mut self.targets.RTFormats[count..] {
+                        *f = DXGI_FORMAT_UNKNOWN;
                     }
                 }
                 16 => {
@@ -545,8 +549,12 @@ impl HostPipeline {
         };
         let state = g.describe();
         if mesh.is_some() {
+            // "mesh triangles": the stream names its topology since it does not
+            // load from the library without one (see `mesh_pipeline`); a
+            // new name keeps older entries without topology from being
+            // looked up again.
             let name = super::library::name(
-                "mesh",
+                "mesh triangles",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
@@ -583,7 +591,11 @@ impl HostPipeline {
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
-                pInputElementDescs: g.inputs.as_ptr(),
+                pInputElementDescs: if g.inputs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    g.inputs.as_ptr()
+                },
                 NumElements: g.inputs.len() as u32,
             },
             IBStripCutValue: g.strip_cut,
@@ -670,6 +682,7 @@ fn mesh_pipeline(
         targets: Sub<D3D12_RT_FORMAT_ARRAY>,
         dsv: Sub<DXGI_FORMAT>,
         samples: Sub<DXGI_SAMPLE_DESC>,
+        topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
     let mut stream = Stream {
         root: Sub(
@@ -694,6 +707,10 @@ fn mesh_pipeline(
             g.depth_format,
         ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+        topology: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        ),
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of::<Stream>(),
@@ -807,6 +824,9 @@ fn root_signature(
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+
     use super::*;
 
     #[test]
@@ -818,5 +838,78 @@ mod tests {
         let (comp_root, comp_bytes) = root_signature(&host.device, &[], &[], true).unwrap();
         assert!(!comp_bytes.is_empty());
         let _ = comp_root;
+    }
+
+    /// A triangle mesh shader of our own and a pixel shader for it.
+    const MS: &str = "struct V { float4 p : SV_Position; };
+        [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
+        void main(out vertices V v[3], out indices uint3 t[1]) {
+            SetMeshOutputCounts(3, 1);
+            v[0].p = float4(0, 0, 0, 1);
+            v[1].p = float4(1, 0, 0, 1);
+            v[2].p = float4(0, 1, 0, 1);
+            t[0] = uint3(0, 1, 2);
+        }";
+    const PS: &str = "float4 main() : SV_Target { return 1; }";
+
+    /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
+    fn dxc() -> Option<PathBuf> {
+        let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+            Some(p) => PathBuf::from(p),
+            None => victory_shader::emit::validator::Validator::default_path()?
+                .with_file_name("dxc.exe"),
+        };
+        dxc.exists().then_some(dxc)
+    }
+
+    fn compile(dxc: &Path, dir: &Path, src: &str, profile: &str) -> Vec<u8> {
+        let (hlsl, out) = (
+            dir.join(format!("{profile}.hlsl")),
+            dir.join(format!("{profile}.dxil")),
+        );
+        std::fs::write(&hlsl, src).unwrap();
+        let status = std::process::Command::new(dxc)
+            .args(["-nologo", "-T", profile, "-E", "main", "-Fo"])
+            .arg(&out)
+            .arg(&hlsl)
+            .status()
+            .unwrap();
+        assert!(status.success(), "dxc failed for {profile}");
+        std::fs::read(out).unwrap()
+    }
+
+    fn code(bytes: &[u8]) -> D3D12_SHADER_BYTECODE {
+        D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        }
+    }
+
+    /// A mesh pipeline made once is loaded from the library the next time,
+    /// not compiled again (a stream without a topology never loads).
+    #[test]
+    fn a_mesh_pipeline_loads_from_the_library() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        assert!(
+            super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
+            "the mesh pipeline was compiled again instead of loaded from the library"
+        );
     }
 }
