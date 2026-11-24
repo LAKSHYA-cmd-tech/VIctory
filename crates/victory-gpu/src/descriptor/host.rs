@@ -350,8 +350,12 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // Search from `next` on, then from the start (extending up to n - 1
+        // slots to catch ranges that cross `next`).
+        let cursor = *next as usize;
+        let end = self.dynamic as usize;
+        let second_end = cursor.saturating_add(n - 1).min(end);
+        let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -1549,6 +1553,22 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A contiguous free range crossing the dynamic search cursor is found (#871).
+    #[test]
+    fn dynamic_allocator_finds_range_crossing_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        {
+            let mut guard = heap.next.lock().unwrap();
+            guard.0 = 3;
+            guard.1.fill(true);
+            guard.1[1..=4].fill(false);
+        }
+        // Slots 1..=4 are free, cursor is at 3. Requesting 4 slots must succeed at index count + 1.
+        assert_eq!(heap.dynamic(4), Some(heap.count + 1));
     }
 
     /// A large requested descriptor count is capped at PORTABLE_VIEWS
