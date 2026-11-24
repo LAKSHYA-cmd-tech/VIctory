@@ -19,7 +19,8 @@ pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have `dynamic` more.
+    /// Slots mirroring the title's; view heaps have `dynamic` more, then
+    /// their guard slot ([`HostHeap::guard_slot`]).
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
     /// where the host takes them, else [`MIN_DYNAMIC`].
@@ -192,6 +193,7 @@ impl HostHeap {
             }
         };
         let aliases = if sampler { 0 } else { ALIASES };
+        let guard = if sampler { 0 } else { 1 };
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         let (heap, count, extra) = if sampler {
@@ -209,9 +211,9 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if count + DYNAMIC + aliases <= PORTABLE_VIEWS && let Ok(heap) = make(count + DYNAMIC + aliases) {
+        } else if count + DYNAMIC + aliases + guard <= PORTABLE_VIEWS && let Ok(heap) = make(count + DYNAMIC + aliases + guard) {
             (heap, count, DYNAMIC)
-        } else if count + MIN_DYNAMIC + aliases <= PORTABLE_VIEWS && let Ok(heap) = make(count + MIN_DYNAMIC + aliases) {
+        } else if count + MIN_DYNAMIC + aliases + guard <= PORTABLE_VIEWS && let Ok(heap) = make(count + MIN_DYNAMIC + aliases + guard) {
             (heap, count, MIN_DYNAMIC)
         } else {
             // shortcut: descriptors past the host's limit are left
@@ -225,7 +227,7 @@ impl HostHeap {
             } else {
                 MIN_DYNAMIC.min(total / 2)
             };
-            (heap, total.saturating_sub(extra + aliases), extra)
+            (heap, total.saturating_sub(extra + aliases + guard), extra)
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -239,7 +241,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra + aliases) * u64::from(step),
+            u64::from(count + extra + aliases + guard) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -272,7 +274,7 @@ impl HostHeap {
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra + aliases) {
+        if let Err(e) = h.fill_null(kind, count + extra + aliases + guard) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         if !sampler {
@@ -421,6 +423,19 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// The slot translated shaders read in place of a computed heap index
+    /// at or past it (a stale buffer can give any index, and one past the
+    /// heap hangs some GPUs): in a view heap its last slot, after the
+    /// dynamic ones, null from the start and never made; in a sampler heap
+    /// its last slot (any sampler reads safely).
+    pub(crate) fn guard_slot(&self) -> u32 {
+        if self.sampler {
+            self.count.saturating_sub(1)
+        } else {
+            self.count + self.dynamic + ALIASES
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -1875,8 +1890,8 @@ mod tests {
             return;
         }
         if let Some(heap) = HostHeap::new(false, 1_048_576) {
-            assert!(heap.count + heap.dynamic + ALIASES <= PORTABLE_VIEWS);
-            assert_eq!(heap.count, PORTABLE_VIEWS - heap.dynamic - ALIASES);
+            assert!(heap.count + heap.dynamic + ALIASES + 1 <= PORTABLE_VIEWS);
+            assert_eq!(heap.count, PORTABLE_VIEWS - heap.dynamic - ALIASES - 1);
         }
     }
 

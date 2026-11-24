@@ -13,7 +13,12 @@
 //!   heap: the descriptor index times 32 for CBV/SRV/UAV tables, times 16
 //!   for sampler tables (the console's descriptor sizes; the code adds
 //!   offsets in those units). The heap bases of dynamic resources are 0
-//!   and not listed.
+//!   and not listed. An entry of root type `ResourceHeap` (`SamplerHeap`)
+//!   is a guard slot of the bound view (sampler) heap, past the title's
+//!   console dwords: every heap index the code computes at or above it
+//!   reads that slot instead (an index past a heap hangs some GPUs). The
+//!   host keeps a view heap's guard slot null and gives no table or title
+//!   descriptor a slot at or above it; any sampler slot will do.
 //! * **Descriptors** through SM 6.6 `ResourceDescriptorHeap[]` and
 //!   `SamplerDescriptorHeap[]`, at the index the console address gives, so
 //!   the host heaps keep the title's descriptor order. The root signature
@@ -218,7 +223,8 @@ pub struct UserData {
     pub index: u32,
     /// Root parameter index in the title's root signature.
     pub slot: u8,
-    /// `Constants` or `Table` (see the module notes for the value).
+    /// `Constants` or `Table`, or `ResourceHeap` / `SamplerHeap` for a
+    /// heap's guard slot (see the module notes for the value).
     pub root: RootType,
     /// Dword within the parameter.
     pub dword: u32,
@@ -973,6 +979,22 @@ mod tests {
             .collect()
     }
 
+    #[cfg(windows)]
+    fn user_constants(cs: &super::HostShader, constants: &[u32]) -> Vec<u32> {
+        let mut ud = vec![0u32; cs.user_data_dwords().max(constants.len() as u32) as usize];
+        for (i, &c) in constants.iter().enumerate() {
+            if i < ud.len() {
+                ud[i] = c;
+            }
+        }
+        for u in &cs.user_data {
+            if let crate::native::RootType::ResourceHeap | crate::native::RootType::SamplerHeap = u.root {
+                ud[u.index as usize] = u32::MAX;
+            }
+        }
+        ud
+    }
+
     /// What the GPU side makes for a buffer view of `count` elements of
     /// `stride` bytes from element `first` of the buffer in heap slot `of`:
     /// the raw view of those bytes (to go in heap slot `raw_slot`) and the
@@ -1103,7 +1125,7 @@ mod tests {
                     &pso,
                     &Dispatch {
                         roots: vec![
-                            (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (0, Root::Constants(user_constants(&cs, &[0, 0, 0, 0, 0]))),
                             (
                                 1,
                                 Root::View {
@@ -1227,7 +1249,7 @@ mod tests {
                             &pso,
                             &Dispatch {
                                 roots: vec![
-                                    (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                                    (0, Root::Constants(user_constants(&cs, &[0, 0, 0, 0, 0]))),
                                     (
                                         1,
                                         Root::View {
@@ -1320,7 +1342,7 @@ mod tests {
                             &pso,
                             &Dispatch {
                                 roots: vec![
-                                    (0, Root::Constants(vec![s0, 0, 0, 0, 0])),
+                                    (0, Root::Constants(user_constants(&cs, &[s0, 0, 0, 0, 0]))),
                                     (
                                         1,
                                         Root::View {

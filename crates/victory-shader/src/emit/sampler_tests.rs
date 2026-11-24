@@ -175,7 +175,13 @@ fn groups_sample_with_the_sampler_their_branch_chose() {
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let crate::native::RootType::ResourceHeap | crate::native::RootType::SamplerHeap = u.root {
+                ud[u.index as usize] = super::host::guard(u.root, views.len(), heap_samplers.len())
+                    .unwrap_or(u32::MAX);
+            }
+        }
         let uavs = host
             .dispatch(
                 &root,
