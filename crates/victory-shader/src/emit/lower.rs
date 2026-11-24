@@ -802,7 +802,7 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn lower_ir(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -877,7 +877,11 @@ impl<'a> Lower<'a> {
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
-        self.fill_phis()?;
+        self.fill_phis()
+    }
+
+    fn run(mut self) -> Result<Lowered, Stop> {
+        self.lower_ir()?;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -5495,8 +5499,7 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            let first = usize::from(offset_word) + usize::from(op == 61) + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -6760,5 +6763,89 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn image_sample_b_cl_consumes_clamp_after_biased_coordinates() {
+        let words: [u32; 18] = [
+            0xBE82_0309,
+            0xBE89_0380,
+            0xBE83_0380,
+            0xF408_0204,
+            0xFA00_0000, // sampler table
+            0xF40C_0001,
+            0xFA00_0000, // resource table
+            0x7E08_02FF,
+            0x3E80_0000, // v4: bias = 0.25
+            0x7E0A_02F0, // v5: u = 0.5
+            0x7E0C_02FF,
+            0x3F40_0000, // v6: v = 0.75
+            0x7E0E_02F4, // v7: min LOD clamp = 2.0
+            0xF098_0F08,
+            0x0040_0004, // image_sample_b_cl v[0:3], v[4:7]
+            0xF800_080F,
+            0x0302_0100, // exp mrt0 v0, v1, v2, v3 done
+            S_ENDPGM,
+        ];
+        let root = |user_data, slot| crate::RootParam {
+            root: crate::RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![root(8, 0), root(9, 1)],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![super::SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            }],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let bad = std::collections::HashMap::new();
+        let mut shader = super::Lower::new(&parts, &bad);
+        assert!(shader.lower_ir().is_ok());
+        assert_eq!(
+            shader.s.m.constant_sample_bias_args(),
+            Some([
+                0.5f32.to_bits(),
+                0.75f32.to_bits(),
+                0.25f32.to_bits(),
+                2.0f32.to_bits()
+            ]),
+        );
     }
 }

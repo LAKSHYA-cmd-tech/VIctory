@@ -272,6 +272,27 @@ impl Module {
         let t = self.int(1);
         self.int_const(t, -i64::from(v))
     }
+    #[cfg(test)]
+    pub fn constant_sample_bias_args(&self) -> Option<[u32; 4]> {
+        let args = self.insts.iter().find_map(|inst| match &inst.op {
+            Op::Call(fun, args) if self.funcs[*fun as usize].name == "dx.op.sampleBias.f32" => {
+                Some(args)
+            }
+            _ => None,
+        })?;
+        let bits = |arg| {
+            let V::Inst(i) = args[arg] else { return None };
+            let Op::Cast(Cast::Bitcast, V::Const(c)) = self.insts[i as usize].op else {
+                return None;
+            };
+            match self.consts[c as usize].1 {
+                Const::Int(value) => Some(value as u32),
+                _ => None,
+            }
+        };
+        Some([bits(3)?, bits(4)?, bits(10)?, bits(11)?])
+    }
+
     pub fn f32(&mut self, bits: u32) -> V {
         let t = self.float();
         self.constant(t, Const::Float(bits))
