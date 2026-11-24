@@ -559,4 +559,32 @@ mod tests {
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
     }
+
+    #[test]
+    fn format_support_reports_native_capabilities_or_fallback() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let query_format = |format: u32| {
+            let mut q = [format, 0, 0];
+            let hr = check(device, 3, (&raw mut q).cast(), 12);
+            (hr, q)
+        };
+        // Unmapped guest formats return 0 support
+        let (hr, q) = query_format(116);
+        assert_eq!(hr, S_OK);
+        assert_eq!(q[1..], [0, 0]);
+
+        let (hr, q) = query_format(189);
+        assert_eq!(hr, S_OK);
+        assert_eq!(q[1..], [0, 0]);
+
+        // BC1_UNORM (71) is not a valid render target on host adapters
+        let (hr, q) = query_format(71);
+        assert_eq!(hr, S_OK);
+        if crate::host::host().is_some() {
+            use windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+            assert_eq!(q[1] & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32, 0);
+        }
+    }
 }
