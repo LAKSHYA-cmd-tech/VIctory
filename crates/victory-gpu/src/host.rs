@@ -2025,6 +2025,13 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(next.texture_due(&a));
     }
 
+    #[test]
+    fn host_written_texture_records_and_forgets() {
+        let fake_resource = 0x1234_5678 as crate::object::This;
+        crate::texture::host_written(fake_resource);
+        crate::texture::forget(fake_resource as usize);
+    }
+
     /// The hashing a submission does for textures in physical-page memory,
     /// with every list checking the textures it samples (before) and with
     /// each checked once (after). Run with
