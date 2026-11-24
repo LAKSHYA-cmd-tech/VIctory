@@ -927,7 +927,10 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = self.take_dynamic(host, std::ptr::from_ref(heap) as usize, n) else {
+            let Some(first) = self
+                .take_dynamic(host, std::ptr::from_ref(heap) as usize, n)
+                .or_else(|| host.recycle_dynamic(n))
+            else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
