@@ -95,7 +95,10 @@ impl Title {
                 .find(|(p, _)| p == path)
                 .map(|(_, text)| text.as_str())
         };
-        let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
+        let id = get("Game/TitleId").and_then(|v| {
+            let v = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+            u32::from_str_radix(v, 16).ok()
+        });
         let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
         Title {
             id: id.unwrap_or(0),
@@ -148,10 +151,20 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
+        let body = if closed {
+            String::new()
+        } else {
+            let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
+            [
+                ("&lt;", "<"),
+                ("&gt;", ">"),
+                ("&quot;", "\""),
+                ("&apos;", "'"),
+                ("&amp;", "&"),
+            ]
             .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c))
+        };
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -222,5 +235,24 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn parses_hex_prefixed_title_ids() {
+        let t1 = Title::from_manifest("<Game><TitleId>0x639AA8DD</TitleId></Game>");
+        assert_eq!(t1.id, 0x639A_A8DD);
+        let t2 = Title::from_manifest("<Game><TitleId>0X1234ABCD</TitleId></Game>");
+        assert_eq!(t2.id, 0x1234_ABCD);
+        let t3 = Title::from_manifest("<Game><TitleId>639AA8DD</TitleId></Game>");
+        assert_eq!(t3.id, 0x639A_A8DD);
+    }
+
+    #[test]
+    fn isolates_self_closing_element_bodies() {
+        let el = elements("<Game><Identity Name=\"x\"/>  \n<TitleId>12345678</TitleId></Game>");
+        let identity = el.iter().find(|(path, _)| path == "Game/Identity").unwrap();
+        assert_eq!(identity.1, "");
+        let title_id = el.iter().find(|(path, _)| path == "Game/TitleId").unwrap();
+        assert_eq!(title_id.1, "12345678");
     }
 }
