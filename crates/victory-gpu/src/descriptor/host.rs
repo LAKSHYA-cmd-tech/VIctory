@@ -62,6 +62,9 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The maximum shader-visible sampler count on D3D12 (all tiers).
+const PORTABLE_SAMPLERS: u32 = 2048;
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -71,7 +74,7 @@ const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
+const MIN_DYNAMIC: u32 = 1 << 18;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -96,10 +99,17 @@ impl HostHeap {
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         let (heap, count, extra) = if sampler {
-            match make(count) {
-                Ok(heap) => (heap, count, 0),
+            let requested = count;
+            let target_count = if count > PORTABLE_SAMPLERS {
+                tracing::warn!(count, "host sampler heap capped at {PORTABLE_SAMPLERS}");
+                PORTABLE_SAMPLERS
+            } else {
+                count
+            };
+            match make(target_count) {
+                Ok(heap) => (heap, target_count, 0),
                 Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    tracing::warn!(error = %e, count = requested, sampler, "no host descriptor heap");
                     return None;
                 }
             }
@@ -156,13 +166,17 @@ impl HostHeap {
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
         const BLOCK: u32 = 1 << 16;
+        let block_size = BLOCK.min(total);
+        if block_size == 0 {
+            return Ok(());
+        }
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
                 host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: BLOCK,
+                    NumDescriptors: block_size,
                     ..Default::default()
                 })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
@@ -175,14 +189,14 @@ impl HostHeap {
                 null_view(start);
             }
             let mut filled = 1;
-            while filled < BLOCK {
-                let n = filled.min(BLOCK - filled);
+            while filled < block_size {
+                let n = filled.min(block_size - filled);
                 host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
                 filled += n;
             }
             let mut done = 0;
             while done < total {
-                let n = BLOCK.min(total - done);
+                let n = block_size.min(total - done);
                 host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
             }
@@ -976,6 +990,19 @@ mod tests {
         }
         if let Some(heap) = HostHeap::new(false, 1_048_576) {
             assert!(heap.count + heap.dynamic <= PORTABLE_VIEWS);
+            assert_eq!(heap.dynamic, MIN_DYNAMIC);
+            assert_eq!(heap.count, PORTABLE_VIEWS - MIN_DYNAMIC);
+        }
+    }
+
+    /// A sampler heap larger than 2048 descriptors is capped at PORTABLE_SAMPLERS (#744).
+    #[test]
+    fn sampler_heap_larger_than_2048_is_capped() {
+        if host().is_none() {
+            return;
+        }
+        if let Some(heap) = HostHeap::new(true, 4096) {
+            assert_eq!(heap.count, PORTABLE_SAMPLERS);
         }
     }
 
