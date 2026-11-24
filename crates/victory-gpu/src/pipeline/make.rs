@@ -76,10 +76,11 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
+            let geometry = p.shaders.iter().any(|s| s.stage == "geometry");
             let failed: Vec<String> = p
                 .shaders
                 .iter()
-                .filter(|s| matches!(s.translated.get(), Some(None)))
+                .filter(|s| s.failed(super::Program::of(s.stage, geometry)))
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {
@@ -165,10 +166,16 @@ fn queue(p: Arc<Pending>) {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let receiver = Arc::new(Mutex::new(receiver));
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        // The driver compiles pipelines on these threads; NVIDIA's compiler
+        // recurses deeply on world compute shaders and overflows Rust's
+        // default 2 MB stack (#966). A 64 MB stack is reserved address space;
+        // only what the compiler uses is committed.
+        const WORKER_STACK: usize = 64 << 20;
         for i in 0..workers {
             let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                .stack_size(WORKER_STACK)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
