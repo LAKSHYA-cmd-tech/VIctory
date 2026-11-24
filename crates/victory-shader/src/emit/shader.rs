@@ -15,6 +15,79 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where root SRVs at addresses passed in two root constants are bound:
 /// `t<n>` in this space, `n` the position in the shader's list of them.
 pub const ROOT_ADDRESS_SPACE: u32 = 2;
+/// Where the host's runtime stride table is bound: `t0` in this space
+/// (one [`StrideEntry`] per view-heap slot).
+pub const STRIDE_SPACE: u32 = 3;
+
+/// What the host writes per view-heap slot in the runtime stride table, for
+/// buffers a shader reads without a stride known when it was translated.
+///
+/// The shader reads such a buffer through a raw handle, and a raw handle
+/// reads a raw view only: over a structured or typed view D3D12 leaves the
+/// result undefined (an RTX 5070 reads other dwords than a Radeon or WARP
+/// do). So the host makes a raw view of the same bytes in another slot for
+/// every buffer view that is not raw, and says here where it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StrideEntry {
+    /// Bytes per element of the view in the slot (0: no buffer view).
+    pub stride: u32,
+    /// The heap slot holding a raw view of the bytes the slot's view reads;
+    /// none when the slot's own view is raw (or reads nothing).
+    pub raw_slot: Option<u32>,
+    /// Bytes from the start of that raw view to the slot's view's first
+    /// byte: a multiple of 4 below 16 ([`RawWindow`]).
+    pub bias: u32,
+}
+
+impl StrideEntry {
+    /// Bytes per entry in the table: slot `i`'s entry is at `i * BYTES`.
+    pub const BYTES: u32 = 8;
+    /// The raw slots an entry can name.
+    pub const RAW_SLOTS: u32 = (1 << 28) - 1;
+
+    /// The entry as the shader reads it: the stride, then the raw slot plus
+    /// one in the low 28 bits (0: the slot itself) under the bias. A table
+    /// of zeros sends every slot to itself.
+    pub fn words(self) -> [u32; 2] {
+        debug_assert!(self.bias < 16);
+        let raw = self.raw_slot.map_or(0, |s| {
+            debug_assert!(s < Self::RAW_SLOTS);
+            s + 1
+        });
+        [self.stride, raw | self.bias << 28]
+    }
+}
+
+/// A raw view covering bytes `[start, start + len)` of a buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawWindow {
+    /// The view's first element (4 bytes each).
+    pub first: u64,
+    /// Its element count.
+    pub dwords: u32,
+    /// Bytes from the view's start to `start` ([`StrideEntry::bias`]).
+    pub bias: u32,
+}
+
+impl RawWindow {
+    /// The window for bytes `[start, start + len)`. The host wants raw
+    /// views to start on 16 bytes (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`), the
+    /// console on 4, so the view starts up to 12 bytes early and the shader
+    /// adds the difference. None for a start off a dword (raw loads drop
+    /// the low address bits) or a view too long to count.
+    pub fn covering(start: u64, len: u64) -> Option<RawWindow> {
+        if !start.is_multiple_of(4) {
+            return None;
+        }
+        let bias = start % 16;
+        let dwords = u32::try_from((bias + len).div_ceil(4).max(1)).ok()?;
+        Some(RawWindow {
+            first: (start - bias) / 4,
+            dwords,
+            bias: bias as u32,
+        })
+    }
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -73,6 +146,8 @@ pub(crate) struct Shader {
     /// Root SRVs (raw buffers) at addresses in root constants, by the low
     /// half's user-data index, with their handles.
     pub address_srvs: Vec<(u32, V)>,
+    /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
+    pub stride_table: Option<V>,
     pub flags: u64,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
@@ -127,6 +202,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             address_srvs: Vec::new(),
+            stride_table: None,
             flags: 0,
             threads: None,
             wave_size: None,
@@ -268,6 +344,32 @@ impl Shader {
         h
     }
 
+    /// The handle of the host's runtime stride table (`t0` in
+    /// [`STRIDE_SPACE`], a raw buffer of [`StrideEntry`] words indexed by
+    /// view-heap slot).
+    pub fn stride_table_handle(&mut self) -> V {
+        if let Some(h) = self.stride_table {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(STRIDE_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.stride_table = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -342,6 +444,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.address_srvs.is_empty()
+            || self.stride_table.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -396,7 +499,7 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() || !self.address_srvs.is_empty() {
+            if !self.root_srvs.is_empty() || !self.address_srvs.is_empty() || self.stride_table.is_some() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
@@ -404,13 +507,16 @@ impl Shader {
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
                 // Root SRVs by root parameter, then those at addresses in
-                // root constants by position.
-                let views = self
+                // root constants by position, then the runtime stride table.
+                let mut views = self
                     .root_srvs
                     .iter()
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain((0..self.address_srvs.len() as u32).map(|n| (ROOT_ADDRESS_SPACE, n)))
                     .collect::<Vec<_>>();
+                if self.stride_table.is_some() {
+                    views.push((STRIDE_SPACE, 0));
+                }
                 for (n, (space, register)) in views.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),

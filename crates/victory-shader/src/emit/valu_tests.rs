@@ -154,6 +154,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, String> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         address_srvs: lowered.address_srvs,
+        stride_table: lowered.stride_table,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
