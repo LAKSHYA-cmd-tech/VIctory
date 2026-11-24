@@ -1002,5 +1002,4 @@ mod tests {
         // Resource is null, so make() returns None and made[0] stays 0 for later retry.
         assert_eq!(heap.made.lock().unwrap()[0], 0);
     }
-    }
 }
