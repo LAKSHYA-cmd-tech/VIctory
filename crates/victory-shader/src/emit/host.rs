@@ -9,8 +9,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{Interface, PCSTR};
 
-use super::HostShader;
 use super::container::SigElement;
+use super::{HostShader, Wave64Mode};
 use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
@@ -73,6 +73,15 @@ impl Host {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                let desc = adapter
+                    .cast::<IDXGIAdapter1>()
+                    .map_err(err)?
+                    .GetDesc1()
+                    .map_err(err)?;
+                // DXGI under Wine/DXVK may return the first hardware adapter for EnumWarpAdapter.
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                    return Err("WARP adapter is not a software adapter".to_string());
+                }
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
@@ -98,6 +107,51 @@ impl Host {
         }
     }
 
+    /// Wave-operation support and `(min, max)` hardware lane counts.
+    pub fn wave_lanes(&self) -> (bool, u32, u32) {
+        let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: plain D3D12 feature query with valid struct size.
+        let ok = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opts).cast(),
+                size_of_val(&opts) as u32,
+            )
+        }
+        .is_ok();
+        if !ok {
+            return (false, 0, 0);
+        }
+        (
+            opts.WaveOps.as_bool(),
+            opts.WaveLaneCountMin,
+            opts.WaveLaneCountMax,
+        )
+    }
+
+    /// Whether the host supports compute shaders requiring 64-lane waves.
+    pub fn supports_wave64(&self) -> bool {
+        let (ops, min, max) = self.wave_lanes();
+        ops && min <= 64 && max >= 64
+    }
+
+    /// Whether the host supports compute shaders requiring 32-lane waves.
+    pub fn supports_wave32(&self) -> bool {
+        let (ops, min, max) = self.wave_lanes();
+        ops && min <= 32 && max >= 32
+    }
+
+    /// Best Wave64 compute lowering strategy supported by this host device.
+    pub fn recommended_wave64_mode(&self) -> Wave64Mode {
+        if self.supports_wave64() {
+            Wave64Mode::Native
+        } else if self.supports_wave32() {
+            Wave64Mode::Wave32
+        } else {
+            Wave64Mode::Emulate
+        }
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
@@ -113,7 +167,8 @@ impl Host {
     }
 
     /// The root signature for these stages: user data of stage k is root
-    /// parameter k, root views follow.
+    /// parameter k, root views follow, then the root SRVs at addresses in
+    /// root constants.
     pub fn root_signature_for(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
@@ -152,6 +207,36 @@ impl Host {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
                         RegisterSpace: super::ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        // Root SRVs at addresses in root constants follow, per stage in
+        // order (each stage numbers its own from 0).
+        for &(s, vis) in stages {
+            for n in 0..s.address_srvs.len() as u32 {
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: n,
+                            RegisterSpace: super::ROOT_ADDRESS_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                        },
+                    },
+                    ShaderVisibility: vis,
+                });
+            }
+        }
+        if stages.iter().any(|(s, _)| s.stride_table) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::STRIDE_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -256,6 +341,37 @@ impl Host {
         vs: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        self.graphics_pipeline_with(root, vs, None, ps)
+    }
+
+    /// A pipeline with a geometry stage: the ES half of a vertex container
+    /// as `vs` (`translate_stage(.., HwStage::Es)`), the GS half of a
+    /// geometry container as `gs` (`HwStage::Gs`) and a pixel shader. User
+    /// data of the vertex stage is root parameter 0, the geometry stage's 1,
+    /// the pixel stage's 2; triangles in.
+    pub fn geometry_pipeline(
+        &self,
+        vs: &HostShader,
+        gs: &HostShader,
+        ps: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let root = self.root_signature_for(&[
+            (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (gs, D3D12_SHADER_VISIBILITY_GEOMETRY),
+            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
+        ])?;
+        let pso = self.graphics_pipeline_with(&root, &vs.dxil, Some(&gs.dxil), &ps.dxil)?;
+        Ok((root, pso))
+    }
+
+    /// As [`Host::pipeline_with`], with a geometry stage if `gs` is given.
+    pub fn graphics_pipeline_with(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: Option<&[u8]>,
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
         let names: Vec<CString> = inputs
             .iter()
@@ -287,6 +403,12 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: gs.as_ptr().cast(),
+                    BytecodeLength: gs.len(),
+                }
+            }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
                 FillMode: D3D12_FILL_MODE_SOLID,
@@ -528,6 +650,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        address_srvs: Vec::new(),
+        stride_table: false,
     }
 }
 
@@ -907,6 +1031,7 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
+#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -924,6 +1049,13 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// A buffer UAV of this many dwords, zeroed, viewed as the stride says.
+    BufferUav(u32, Stride),
+    /// A raw view of `dwords` dwords from dword `first` of the buffer the
+    /// view at the (earlier) heap index `of` is made on, an SRV or a UAV as
+    /// that view is: what the GPU side makes for the runtime stride table
+    /// ([`super::RawWindow`]). Not among the UAVs read back.
+    RawAlias { of: usize, first: u32, dwords: u32 },
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1081,9 +1213,12 @@ impl Host {
             let mut keep = Vec::new();
             // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
+            // Buffer views by heap index: (buffer, dwords, unordered).
+            let mut buffers: Vec<Option<(ID3D12Resource, u32, bool)>> = Vec::new();
             for (i, v) in d.views.iter().enumerate() {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
+                buffers.push(None);
                 match *v {
                     View::Texture(..) | View::Cube(..) => {
                         let (w, h, texels, faces) = match *v {
@@ -1152,17 +1287,31 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
-                        // (dwords, format, elements, flags)
-                        let (n, format, elements, flags) = match *v {
+                    View::RawUav(_) | View::HalfUav(_) | View::BufferUav(..) => {
+                        // (dwords, format, elements, element bytes, flags)
+                        let (n, format, elements, stride, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
                                 e,
+                                0,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
-                            View::RawUav(n) => {
-                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                            View::RawUav(n) | View::BufferUav(n, Stride::Raw) => {
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
+                            View::BufferUav(n, Stride::Typed) => (
+                                n,
+                                DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                n / 4,
+                                0,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::BufferUav(n, Stride::Structured(s)) => {
+                                (n, DXGI_FORMAT_UNKNOWN, n * 4 / s, s, D3D12_BUFFER_UAV_FLAG_NONE)
+                            }
+                            View::BufferUav(n, Stride::Format(f, bytes)) => {
+                                (n, f, n * 4 / bytes, 0, D3D12_BUFFER_UAV_FLAG_NONE)
                             }
                             _ => unreachable!(),
                         };
@@ -1178,12 +1327,14 @@ impl Host {
                             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
+                                    StructureByteStride: stride,
                                     Flags: flags,
                                     ..Default::default()
                                 },
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        buffers[i] = Some((b.clone(), n, true));
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1279,7 +1430,48 @@ impl Host {
                             },
                         };
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
+                        buffers[i] = Some((b.clone(), data.len() as u32, false));
                         keep.push(b);
+                    }
+                    View::RawAlias { of, first, dwords } => {
+                        let (b, n, unordered) = buffers
+                            .get(of)
+                            .cloned()
+                            .flatten()
+                            .ok_or("a raw alias of no earlier buffer view")?;
+                        if first + dwords > n {
+                            return Err("a raw alias past its buffer".into());
+                        }
+                        if unordered {
+                            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_UAV {
+                                        FirstElement: u64::from(first),
+                                        NumElements: dwords,
+                                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                        ..Default::default()
+                                    },
+                                },
+                            };
+                            dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        } else {
+                            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_SRV {
+                                        FirstElement: u64::from(first),
+                                        NumElements: dwords,
+                                        StructureByteStride: 0,
+                                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                    },
+                                },
+                            };
+                            dev.CreateShaderResourceView(&b, Some(&desc), at);
+                        }
                     }
                 }
             }
@@ -1376,6 +1568,56 @@ impl Host {
             }
             drop(keep);
             Ok(out)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emit::bitcode::Term;
+    use crate::emit::shader::Shader;
+
+    fn cs_with_wave_size(wave_size: Option<u32>) -> HostShader {
+        let mut s = Shader::new(false);
+        s.threads = Some([64, 1, 1]);
+        s.wave_size = wave_size;
+        s.m.terminate(s.entry, Term::Ret);
+        HostShader {
+            stage: crate::HwStage::Cs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            address_srvs: Vec::new(),
+            stride_table: false,
+        }
+    }
+
+    #[test]
+    fn recommended_wave64_mode_matches_device_capabilities() {
+        for warp in [false, true] {
+            let Ok(h) = Host::new(warp) else {
+                continue;
+            };
+            let mode = h.recommended_wave64_mode();
+            let expected = if h.supports_wave64() {
+                Wave64Mode::Native
+            } else if h.supports_wave32() {
+                Wave64Mode::Wave32
+            } else {
+                Wave64Mode::Emulate
+            };
+            assert_eq!(mode, expected);
+            let required_wave = match mode {
+                Wave64Mode::Native => Some(64),
+                Wave64Mode::Wave32 => Some(32),
+                Wave64Mode::Emulate => None,
+            };
+            h.compute_pipeline(&cs_with_wave_size(required_wave))
+                .expect("recommended Wave64 mode should build a compute PSO");
         }
     }
 }
