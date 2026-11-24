@@ -5,6 +5,8 @@
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
+//! Non-indexed rectangle-list draws follow the clamp with GPU-side
+//! rectangle expansion in [`crate::rectangles`].
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -23,9 +25,28 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
+pub(crate) const DRAW: u32 = 0;
+pub(crate) const INDEXED: u32 = 1;
+pub(crate) const DISPATCH: u32 = 2;
+pub(crate) const MESH: u32 = 10;
+
+pub(crate) fn fits_record(kind: u32, stride: u32, offset: u32) -> bool {
+    let action_bytes = match kind {
+        DRAW => 16,
+        INDEXED => 20,
+        DISPATCH | MESH => 12,
+        _ => return false,
+    };
+    stride.is_multiple_of(4)
+        && offset.is_multiple_of(4)
+        && offset
+            .checked_add(action_bytes)
+            .is_some_and(|end| end <= stride)
+}
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint offset; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
@@ -37,7 +58,7 @@ static const uint GROUPS = 1u << 20;
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
-    uint at = id.x * stride;
+    uint at = id.x * stride + offset;
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -116,7 +137,10 @@ fn make() -> windows::core::Result<Clamp> {
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
             };
             tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
         }
@@ -125,7 +149,8 @@ fn make() -> windows::core::Result<Clamp> {
     let code = code.ok_or_else(windows::core::Error::empty)?;
     // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let bytes =
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -140,24 +165,25 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
-pub(crate) fn bound(
+/// argument numbering) `stride` bytes apart at host address `gpu`, leaving
+/// the buffer in unordered-access state with a UAV barrier after the write
+/// (for passes such as [`crate::rectangles`] that read the clamped records
+/// in another compute shader). Replaces the list's compute root signature
+/// and pipeline (callers bind theirs after). False if the clamp is not
+/// available.
+pub(crate) fn clamp_uav(
     list: &HostList,
-    buffer: &ID3D12Resource,
     gpu: u64,
-    (kind, stride, records): (u32, u32, u32),
+    (kind, stride, records, offset): (u32, u32, u32, u32),
 ) -> bool {
+    if !gpu.is_multiple_of(4) || !fits_record(kind, stride, offset) {
+        return false;
+    }
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
     };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
-        return false;
-    }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, offset];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -169,14 +195,32 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    true
+}
+
+/// Records, in `list`, the clamp of `records` records of `kind` (PC
+/// argument numbering) `stride` bytes apart at host address `gpu` in
+/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
+/// the list's compute root signature and pipeline (callers bind theirs
+/// after). False if the clamp is not available.
+pub(crate) fn bound(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    spec: (u32, u32, u32, u32),
+) -> bool {
+    if !clamp_uav(list, gpu, spec) {
+        return false;
+    }
+    // SAFETY: an open list and a live buffer.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(
+            buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
     }
     true
 }
@@ -194,24 +238,72 @@ pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
         },
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
-        if super::host().is_none() {
+        if host().is_none() {
             return; // no host GPU here
         }
-        assert!(super::clamp().is_some());
+        assert!(clamp().is_some());
+    }
+
+    #[test]
+    fn indirect_clamp_bounds_the_action_after_its_root_constant() {
+        let Some(host) = host() else {
+            eprintln!("skipping D3D12 argument clamp test: no host device");
+            return;
+        };
+        // Two padded records exercise both the action offset and the stride.
+        let mut expected = [
+            0xdeadbeef,
+            u32::MAX,
+            1,
+            17,
+            19,
+            23,
+            0xcafef00d,
+            u32::MAX,
+            1,
+            29,
+            31,
+            37,
+        ];
+        let (buffer, data) = host
+            .shared_buffer(std::mem::size_of_val(&expected) as u64)
+            .unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the buffer is mapped and exactly large enough for both records.
+        let gpu = unsafe {
+            data.cast::<[u32; 12]>().write(expected);
+            buffer.GetGPUVirtualAddress()
+        };
+        assert!(!bound(&list, &buffer, gpu, (DRAW, 23, 2, 4)));
+        assert!(!bound(&list, &buffer, gpu, (DRAW, 24, 2, 2)));
+        assert!(!bound(&list, &buffer, gpu, (DRAW, 24, 2, 12)));
+        assert!(bound(&list, &buffer, gpu, (DRAW, 24, 2, 4)));
+        list.close();
+        host.execute(&[&list]);
+
+        expected[1] = 1 << 24;
+        expected[7] = 1 << 24;
+        // SAFETY: submission completed and the mapping is still alive.
+        assert_eq!(unsafe { data.cast::<[u32; 12]>().read() }, expected);
+        assert_eq!(host.log_messages(), None);
     }
 }
