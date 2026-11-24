@@ -1171,3 +1171,184 @@ fn scalar_loads_through_a_root_constant_pair_read_its_root_srv() {
         vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
     ]);
 }
+
+#[test]
+fn v_mov_b32_modifiers_are_bitwise() {
+    let vop3_mods = |op: u16, dst: u8, s0: u16, s1: u16, s2: u16, abs: u32, neg: u32| {
+        let [mut w0, mut w1] = vop3(op, dst, s0, s1, s2);
+        w0 |= (abs & 7) << 8;
+        w1 |= (neg & 7) << 29;
+        [w0, w1]
+    };
+
+    // v_mov_b32_e64 v0, -v1 / |v1| / -|v1| (VOP3 opcode 0x181)
+    let mov_neg = build_valu_cs(&vop3_mods(0x181, 0, vgpr(1), 0, 0, 0, 1));
+    let mov_abs = build_valu_cs(&vop3_mods(0x181, 0, vgpr(1), 0, 0, 1, 0));
+    let mov_neg_abs = build_valu_cs(&vop3_mods(0x181, 0, vgpr(1), 0, 0, 1, 1));
+    // v_mov_b32_sdwa v0, -v1 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD
+    let mov_sdwa_neg = build_valu_cs(&[vop1(0x001, 0, 0xF9), 1 | (6 << 8) | (6 << 16) | (1 << 20)]);
+    // v_mov_b32_e64 v0, -v1 clamp mul:2 (output modifiers still run on floats)
+    let [mut mov_co_w0, mut mov_co_w1] = vop3_mods(0x181, 0, vgpr(1), 0, 0, 0, 1);
+    mov_co_w0 |= 1 << 15; // clamp
+    mov_co_w1 |= 1 << 27; // omod = mul:2
+    let mov_neg_clamp_omod = build_valu_cs(&[mov_co_w0, mov_co_w1]);
+
+    // Normals, signed zeros, infinities, subnormals (must not flush to zero),
+    // and signalling/quiet NaNs (must not quiet payload or lose sign bit).
+    let values: &[u32] = &[
+        0x3F80_0000, // +1.0
+        0xBF80_0000, // -1.0
+        0x0000_0000, // +0.0
+        0x8000_0000, // -0.0
+        0x7F80_0000, // +inf
+        0xFF80_0000, // -inf
+        0x0000_0001, // +min denormal
+        0x8000_0001, // -min denormal
+        0x007F_FFFF, // +max denormal
+        0x807F_FFFF, // -max denormal
+        0x7F80_0001, // +sNaN
+        0xFF80_0001, // -sNaN
+        0x7FC0_1234, // +qNaN with payload
+        0xFFC0_1234, // -qNaN with payload
+    ];
+    let mov_in: Vec<[u32; 4]> = values.iter().map(|&x| [x, 0, 0, 0]).collect();
+
+    run_cases(&mov_neg, &mov_in, |backend, _, inp, got| {
+        let want = inp[0] ^ 0x8000_0000;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mov_b32_e64(-{:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+    run_cases(&mov_abs, &mov_in, |backend, _, inp, got| {
+        let want = inp[0] & 0x7FFF_FFFF;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mov_b32_e64(|{:#010x}|) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+    run_cases(&mov_neg_abs, &mov_in, |backend, _, inp, got| {
+        let want = inp[0] | 0x8000_0000;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mov_b32_e64(-|{:#010x}|) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+    run_cases(&mov_sdwa_neg, &mov_in, |backend, _, inp, got| {
+        let want = inp[0] ^ 0x8000_0000;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mov_b32_sdwa(-{:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+    let clamp_omod_cases: &[([u32; 4], u32)] = &[
+        ([(-0.25f32).to_bits(), 0, 0, 0], 0.5f32.to_bits()),
+        ([(-1.0f32).to_bits(), 0, 0, 0], 1.0f32.to_bits()),
+        ([0.25f32.to_bits(), 0, 0, 0], 0.0f32.to_bits()),
+    ];
+    let co_in: Vec<[u32; 4]> = clamp_omod_cases.iter().map(|c| c.0).collect();
+    run_cases(&mov_neg_clamp_omod, &co_in, |backend, i, inp, got| {
+        let want = clamp_omod_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mov_b32_e64(-{:#010x}, clamp, mul:2) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+}
+
+#[test]
+fn v_cndmask_b32_modifiers_are_bitwise() {
+    let vop3_mods = |op: u16, dst: u8, s0: u16, s1: u16, s2: u16, abs: u32, neg: u32| {
+        let [mut w0, mut w1] = vop3(op, dst, s0, s1, s2);
+        w0 |= (abs & 7) << 8;
+        w1 |= (neg & 7) << 29;
+        [w0, w1]
+    };
+
+    let values: &[u32] = &[
+        0x3F80_0000, // +1.0
+        0xBF80_0000, // -1.0
+        0x0000_0000, // +0.0
+        0x8000_0000, // -0.0
+        0x7F80_0000, // +inf
+        0xFF80_0000, // -inf
+        0x0000_0001, // +min denormal
+        0x8000_0001, // -min denormal
+        0x007F_FFFF, // +max denormal
+        0x807F_FFFF, // -max denormal
+        0x7F80_0001, // +sNaN
+        0xFF80_0001, // -sNaN
+        0x7FC0_1234, // +qNaN with payload
+        0xFFC0_1234, // -qNaN with payload
+    ];
+
+    // v_cmp_ne_u32_e64 s6, v3, 0 (VOP3 0x0c5);
+    // v_cndmask_b32_e64 v0, -v1, |v2|, s6 (VOP3 0x101)
+    let cmp_cond = vop3(0x0c5, 6, vgpr(3), 0x80, 0);
+    let cnd_neg_abs = vop3_mods(0x101, 0, vgpr(1), vgpr(2), sgpr(6), 0b10, 0b01);
+    let cndmask = build_valu_cs(&[cmp_cond[0], cmp_cond[1], cnd_neg_abs[0], cnd_neg_abs[1]]);
+    let cnd_both = vop3_mods(0x101, 0, vgpr(1), vgpr(2), sgpr(6), 0b01, 0b11);
+    let cndmask_both = build_valu_cs(&[cmp_cond[0], cmp_cond[1], cnd_both[0], cnd_both[1]]);
+    let cnd_one_side = vop3_mods(0x101, 0, vgpr(1), vgpr(2), sgpr(6), 0, 0b01);
+    let cndmask_one_side =
+        build_valu_cs(&[cmp_cond[0], cmp_cond[1], cnd_one_side[0], cnd_one_side[1]]);
+
+    let mut cnd_in = Vec::new();
+    let mut cnd_want = Vec::new();
+    for &x in values {
+        // cond = 0 selects src0 (-v1); cond = 1 selects src1 (|v2|).
+        cnd_in.push([x, 0x3F80_0000, 0, 0]);
+        cnd_want.push(x ^ 0x8000_0000);
+        cnd_in.push([0x3F80_0000, x, 1, 0]);
+        cnd_want.push(x & 0x7FFF_FFFF);
+    }
+    run_cases(&cndmask, &cnd_in, |backend, i, inp, got| {
+        let want = cnd_want[i];
+        assert_eq!(
+            got, want,
+            "{backend}: v_cndmask_b32_e64(-{:#010x}, |{:#010x}|, {}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    let mut both_in = Vec::new();
+    let mut both_want = Vec::new();
+    for &x in values {
+        // cond = 0 selects -|v1|; cond = 1 selects -v2.
+        both_in.push([x, 0, 0, 0]);
+        both_want.push(x | 0x8000_0000);
+        both_in.push([0, x, 1, 0]);
+        both_want.push(x ^ 0x8000_0000);
+    }
+    run_cases(&cndmask_both, &both_in, |backend, i, inp, got| {
+        let want = both_want[i];
+        assert_eq!(
+            got, want,
+            "{backend}: v_cndmask_b32_e64(-|{:#010x}|, -{:#010x}, {}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    let mut one_in = Vec::new();
+    let mut one_want = Vec::new();
+    for &x in values {
+        // cond = 0 selects -v1; cond = 1 passes unmodified v2 through bitwise.
+        one_in.push([x, 0, 0, 0]);
+        one_want.push(x ^ 0x8000_0000);
+        one_in.push([0, x, 1, 0]);
+        one_want.push(x);
+    }
+    run_cases(&cndmask_one_side, &one_in, |backend, i, inp, got| {
+        let want = one_want[i];
+        assert_eq!(
+            got, want,
+            "{backend}: v_cndmask_b32_e64(-{:#010x}, {:#010x}, {}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
