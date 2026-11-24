@@ -107,6 +107,8 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(test)]
+mod mtbuf_tests;
 mod sampler;
 #[cfg(all(test, windows))]
 mod sampler_tests;
