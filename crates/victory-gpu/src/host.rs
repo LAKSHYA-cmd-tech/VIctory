@@ -176,7 +176,9 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_D3D12_WARP").is_some_and(|value| value != "0")
+        {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -275,6 +277,15 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    #[test]
+    fn warp_adapter_setting_ignores_zero() {
+        let is_warp = |val: Option<&str>| val.is_some_and(|v| v != "0");
+        assert!(!is_warp(None));
+        assert!(!is_warp(Some("0")));
+        assert!(is_warp(Some("1")));
+        assert!(is_warp(Some("true")));
     }
 }
 
@@ -2012,6 +2023,13 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn host_written_texture_records_and_forgets() {
+        let fake_resource = 0x1234_5678 as crate::object::This;
+        crate::texture::host_written(fake_resource);
+        crate::texture::forget(fake_resource as usize);
     }
 
     /// The hashing a submission does for textures in physical-page memory,

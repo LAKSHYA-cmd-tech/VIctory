@@ -306,8 +306,38 @@ extern "system" fn check_feature_support(
         FORMAT_SUPPORT => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 3]>() };
-            // shortcut: every use of every format; answer from the host
-            // device once there is one.
+            #[cfg(windows)]
+            if let Some(host) = crate::host::host() {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+                };
+                use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+                // These guest formats have no host mapping. In particular,
+                // PC formats 189–191 represent different data.
+                if matches!(q[0], 116 | 117 | 189..=191) {
+                    q[1..].fill(0);
+                    return S_OK;
+                }
+                let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                    Format: DXGI_FORMAT(resource::pc_format(q[0]) as i32),
+                    ..Default::default()
+                };
+                // SAFETY: the structure and size match the native format support query.
+                if let Err(error) = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut support).cast(),
+                        size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+                    )
+                } {
+                    return error.code().0;
+                }
+                q[1] = support.Support1.0 as u32;
+                q[2] = support.Support2.0 as u32;
+                return S_OK;
+            }
+            // Keep the fallback for runs without a host device.
             q[1] = 0x7fff_ffff;
             q[2] = 0xffff;
             S_OK
@@ -528,5 +558,33 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn format_support_reports_native_capabilities_or_fallback() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let query_format = |format: u32| {
+            let mut q = [format, 0, 0];
+            let hr = check(device, 3, (&raw mut q).cast(), 12);
+            (hr, q)
+        };
+        // Unmapped guest formats return 0 support
+        let (hr, q) = query_format(116);
+        assert_eq!(hr, S_OK);
+        assert_eq!(q[1..], [0, 0]);
+
+        let (hr, q) = query_format(189);
+        assert_eq!(hr, S_OK);
+        assert_eq!(q[1..], [0, 0]);
+
+        // BC1_UNORM (71) is not a valid render target on host adapters
+        let (hr, q) = query_format(71);
+        assert_eq!(hr, S_OK);
+        if crate::host::host().is_some() {
+            use windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+            assert_eq!(q[1] & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32, 0);
+        }
     }
 }

@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::{AddressView, UserData};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -74,16 +75,17 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds (title heap, first, count), given
+    /// back when the list is reset or released, or earlier when a heap runs
+    /// short after the list ran (see [`crate::descriptor::lease`]).
+    lease: std::sync::Arc<crate::descriptor::lease::Lease>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for (heap, first, n) in self.lease.take() {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
@@ -151,6 +153,23 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// Addresses below this are taken as unset (null, or no buffer): a root SRV
+/// at an address in root constants is not bound there and its draw is
+/// dropped.
+const MIN_ADDRESS: u64 = 0x1_0000;
+
+/// The address a root SRV at an address in root constants starts at: the
+/// two constants' current values, low half first. `None` when the title has
+/// not set either or the address is below [`MIN_ADDRESS`].
+fn pair_address(roots: &[Root], view: &AddressView) -> Option<u64> {
+    let half = |u: &UserData| match roots.get(usize::from(u.slot))? {
+        Root::Constants(c) => c.get(u.dword as usize).copied(),
+        _ => None,
+    };
+    let address = u64::from(half(&view.lo)?) | u64::from(half(&view.hi)?) << 32;
+    (address >= MIN_ADDRESS).then_some(address)
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -170,6 +189,44 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// The list's slots, to start and finish its submissions.
+    pub(crate) fn lease(&self) -> &std::sync::Arc<crate::descriptor::lease::Lease> {
+        &self.lease
+    }
+
+    /// `n` consecutive dynamic slots of `host` (the host heap of the title
+    /// heap at address `key`), held by this list. When the heap has no room,
+    /// the slots of the oldest list that already ran are taken back first,
+    /// one list at a time, instead of dropping the draw.
+    fn take_dynamic(
+        &mut self,
+        host: &crate::descriptor::host::HostHeap,
+        key: usize,
+        n: u32,
+    ) -> Option<u32> {
+        let mut reclaimed = false;
+        loop {
+            if let Some(first) = host.dynamic(n) {
+                self.lease.add(key, first, n);
+                return Some(first);
+            }
+            let more = crate::descriptor::lease::reclaim(key, |(heap, first, n)| {
+                if heap == key {
+                    host.release(first, n);
+                } else {
+                    crate::descriptor::release_dynamic(heap, first, n);
+                }
+            });
+            if !more {
+                return None;
+            }
+            if !reclaimed {
+                reclaimed = true;
+                once!("dynamic descriptor slots of lists that already ran are taken back");
+            }
+        }
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -412,10 +469,10 @@ impl State {
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a table it reads could
-    /// not be made.
+    /// descriptors its tables hold. False if a root SRV at an address in
+    /// root constants has no address to bind: the draw cannot run.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let mut bound = true;
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -512,8 +569,29 @@ impl State {
                     }
                 }
             }
+            for &(view, param) in &stage.address_srvs {
+                let gpu = pair_address(self.roots_ref(compute), &view)
+                    .and_then(|address| root_view(list, address, true));
+                let Some(gpu) = gpu else {
+                    once!(
+                        slot = view.lo.slot,
+                        dword = view.lo.dword,
+                        "a shader reads through an address in root constants that is unset; draw dropped"
+                    );
+                    bound = false;
+                    continue;
+                };
+                // SAFETY: an open list; the address is in live memory.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
+                }
+            }
         }
-        true
+        bound
     }
 
     /// Runs a dispatch on the host.
@@ -540,6 +618,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -580,6 +660,16 @@ impl State {
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
                 }
+            }
+            for (view, _) in &stage.address_srvs {
+                let address = pair_address(self.roots_ref(compute), view);
+                let host =
+                    address.and_then(|a| crate::shadow::find(a, 1).map(|s| (s.gpu(a), s.left(a))));
+                let _ = write!(
+                    text,
+                    " u{}:u{}={address:#x?} host {host:#x?}",
+                    view.lo.index, view.hi.index
+                );
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
@@ -670,7 +760,7 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if !heap.samplers() && index >= host.count() {
                 fresh.push(u.slot);
             }
         }
@@ -723,7 +813,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = self.take_dynamic(host, std::ptr::from_ref(heap) as usize, n) else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
@@ -733,8 +823,6 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1214,4 +1302,152 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor::host::HostHeap;
+
+    /// The dynamic slots of an empty heap (and the heap left empty).
+    fn capacity(heap: &HostHeap) -> u32 {
+        let mut n = 0;
+        while heap.dynamic(1).is_some() {
+            n += 1;
+        }
+        heap.release(heap.count(), n);
+        n
+    }
+
+    /// A heap with no room takes back the slots of a list that already ran,
+    /// not of one that has not, and the list that lost them is refused.
+    #[test]
+    fn a_full_heap_takes_back_the_slots_of_a_list_that_ran() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let key = 0x2000_0001;
+        let total = capacity(&heap);
+        let chunk = 1000;
+        let mut ran = State::default();
+        let mut taken = 0;
+        while ran.take_dynamic(&heap, key, chunk).is_some() {
+            taken += chunk;
+        }
+        assert!(taken >= total - chunk, "the list filled the heap");
+        // Nothing has run yet: nothing is given back and the draw is dropped.
+        let mut other = State::default();
+        assert_eq!(other.take_dynamic(&heap, key, chunk), None);
+        assert!(!ran.lease().is_lost());
+        // The list ran: its slots serve the next list, once.
+        assert!(ran.lease().start());
+        ran.lease().finish();
+        assert!(other.take_dynamic(&heap, key, chunk).is_some());
+        assert!(ran.lease().is_lost());
+        assert!(
+            !ran.lease().start(),
+            "a list that lost its slots must not run"
+        );
+        // Everything of the first list is free again except what the other
+        // list now holds, and nothing was given back twice.
+        assert!(ran.lease().take().is_empty());
+        assert_eq!(capacity_left(&heap), total - chunk);
+        // Another request finds no finished list left and is dropped.
+        let mut third = State::default();
+        assert_eq!(third.take_dynamic(&heap, key, total), None);
+    }
+
+    /// Free slots of the heap now (taken and released again).
+    fn capacity_left(heap: &HostHeap) -> u32 {
+        capacity(heap)
+    }
+
+    /// A list that is running when another needs room keeps its slots; a
+    /// list reset by the title gives back its own and is not taken twice.
+    #[test]
+    fn a_running_or_reset_list_is_not_taken_back() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let key = 0x2000_0002;
+        let total = capacity(&heap);
+        let mut running = State::default();
+        let first = running.take_dynamic(&heap, key, total).unwrap();
+        assert_eq!(first, heap.count());
+        running.lease().finish();
+        // Submitted again: it is running and cannot be taken back.
+        assert!(running.lease().start());
+        let mut other = State::default();
+        assert_eq!(other.take_dynamic(&heap, key, 1), None);
+        assert!(!running.lease().is_lost());
+        // It ran: now it can, whole.
+        running.lease().finish();
+        assert_eq!(other.take_dynamic(&heap, key, 1), Some(heap.count()));
+        assert!(running.lease().is_lost());
+        // A lease reset by the title (its slots taken, as `Drop` does) is
+        // skipped: nothing is held, so nothing is taken back.
+        let mut reset = State::default();
+        assert!(reset.take_dynamic(&heap, key, 1).is_some());
+        reset.lease().finish();
+        assert_eq!(reset.lease().take().len(), 1);
+        let mut last = State::default();
+        assert_eq!(last.take_dynamic(&heap, key, total), None);
+        assert!(!reset.lease().is_lost());
+    }
+
+    fn half(slot: u8, dword: u32) -> UserData {
+        UserData {
+            index: 0,
+            slot,
+            root: RootType::Constants,
+            dword,
+        }
+    }
+
+    /// The low half at dword 1 of root parameter 0, the high half at dword 0
+    /// of parameter 2.
+    fn view() -> AddressView {
+        AddressView {
+            lo: half(0, 1),
+            hi: half(2, 0),
+        }
+    }
+
+    fn roots(lo: u32, hi: u32) -> Vec<Root> {
+        vec![
+            Root::Constants(vec![7, lo]),
+            Root::None,
+            Root::Constants(vec![hi]),
+        ]
+    }
+
+    #[test]
+    fn addresses_in_root_constants_are_composed_from_both_halves() {
+        assert_eq!(
+            pair_address(&roots(0x2345_0000, 1), &view()),
+            Some(0x1_2345_0000)
+        );
+        assert_eq!(pair_address(&roots(0x1_0000, 0), &view()), Some(0x1_0000));
+    }
+
+    #[test]
+    fn an_address_with_a_missing_half_is_unset() {
+        let set = roots(0x2345_0000, 1);
+        assert_eq!(pair_address(&set[..2], &view()), None);
+        let mut no_high = set.clone();
+        no_high[2] = Root::Constants(Vec::new());
+        assert_eq!(pair_address(&no_high, &view()), None);
+        let mut not_constants = set.clone();
+        not_constants[0] = Root::View(0x1_0000_0000);
+        assert_eq!(pair_address(&not_constants, &view()), None);
+        let mut short = set;
+        short[0] = Root::Constants(vec![7]);
+        assert_eq!(pair_address(&short, &view()), None);
+    }
+
+    #[test]
+    fn null_and_low_addresses_are_unset() {
+        assert_eq!(pair_address(&roots(0, 0), &view()), None);
+        assert_eq!(pair_address(&roots(0xFFFF, 0), &view()), None);
+    }
 }

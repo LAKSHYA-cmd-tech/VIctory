@@ -133,6 +133,33 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// The dynamic descriptor slots of a title list, if there is a host GPU.
+#[cfg(windows)]
+fn lease(this: This) -> Option<std::sync::Arc<crate::descriptor::lease::Lease>> {
+    host_list(this)?;
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+    Some(state.lease().clone())
+}
+
+/// Before a list is submitted: false if the slots of its tables were taken
+/// back after an earlier submission (a heap ran short, see
+/// [`crate::descriptor::lease`]); it must not run again until it is reset.
+/// Until [`finished`] its slots cannot be taken back.
+#[cfg(windows)]
+pub(crate) fn may_run(this: This) -> bool {
+    lease(this).is_none_or(|lease| lease.start())
+}
+
+/// After a list ran: its slots may be taken back if a heap runs short.
+#[cfg(windows)]
+pub(crate) fn finished(this: This) {
+    if let Some(lease) = lease(this) {
+        lease.finish();
+    }
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
@@ -1069,8 +1096,7 @@ mod state {
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// When `indirect != 0`, executes indirect mesh dispatches.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1080,8 +1106,11 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            const MESH: u32 = 10;
+            const STRIDE: u32 = 12;
+            with_state(this, |list, s| {
+                s.execute_indirect(list, (MESH, STRIDE, x.max(1)), indirect, None);
+            });
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1442,6 +1471,28 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn dispatch_mesh_x_routes_direct_and_indirect_dispatches() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+
+        // Direct mesh dispatch:
+        state::dispatch_mesh_x(list, 4, 0, 0, 0);
+        // Indirect mesh dispatch:
+        state::dispatch_mesh_x(list, 1, 0, 0x10000, 0);
+
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

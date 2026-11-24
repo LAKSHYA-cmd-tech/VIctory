@@ -2,13 +2,16 @@
 //! title's graphics state with the translated shaders, under a root
 //! signature of our own that the translated shaders' bindings define
 //! (`victory_shader::emit`): per stage one block of root constants for the
-//! user data, root views for the title's root views, static samplers for
-//! the immediate samplers, and directly indexed heaps.
+//! user data, root views for the title's root views and for addresses the
+//! title passes in root constants, static samplers for the immediate
+//! samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    AddressView, ROOT_ADDRESS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -251,6 +254,10 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// Root parameters of its root SRVs at addresses in root constants:
+    /// (the two constants, ours), `t<n>` in [`ROOT_ADDRESS_SPACE`] for the
+    /// one at position n.
+    pub(crate) address_srvs: Vec<(AddressView, u32)>,
 }
 
 impl Stage {
@@ -339,6 +346,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                address_srvs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -381,6 +389,20 @@ impl HostPipeline {
                         ShaderVisibility: visibility,
                     });
                 }
+            }
+            for (n, &view) in t.address_srvs.iter().enumerate() {
+                stage.address_srvs.push((view, params.len() as u32));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: n as u32,
+                            RegisterSpace: ROOT_ADDRESS_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
@@ -630,7 +652,9 @@ fn root_signature(
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
-    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+    let heap_indexing = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+    let desc_with = |flags| D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
             Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
@@ -638,30 +662,83 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: flags,
             },
         },
     };
+    let desc = desc_with(input | heap_indexing);
     // SAFETY: the description points at live arrays; the blob is read in
     // full before it is released.
     unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
-            if let Some(error) = error {
+            if let Some(ref error) = error {
                 let text = std::slice::from_raw_parts(
                     error.GetBufferPointer().cast::<u8>(),
                     error.GetBufferSize(),
                 );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+                tracing::warn!(
+                    "root signature: runtime rejected directly-indexed flags ({}), retrying without them",
+                    String::from_utf8_lossy(text)
+                );
             }
-            return Err(e);
+            drop(error.take());
+            blob = None;
+            let retry = desc_with(input);
+            let mut retry_error: Option<ID3DBlob> = None;
+            if let Err(e2) =
+                D3D12SerializeVersionedRootSignature(&retry, &mut blob, Some(&mut retry_error))
+            {
+                if let Some(error) = retry_error {
+                    let text = std::slice::from_raw_parts(
+                        error.GetBufferPointer().cast::<u8>(),
+                        error.GetBufferSize(),
+                    );
+                    tracing::warn!("root signature retry: {}", String::from_utf8_lossy(text));
+                }
+                return Err(e2);
+            }
+            let _ = e;
         }
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        let root = match device.CreateRootSignature(0, bytes) {
+            Ok(root) => (root, bytes.to_vec()),
+            Err(e) => {
+                let retry = desc_with(input);
+                let mut fallback_blob: Option<ID3DBlob> = None;
+                if D3D12SerializeVersionedRootSignature(&retry, &mut fallback_blob, None).is_ok()
+                    && let Some(fallback_blob) = fallback_blob
+                {
+                    let fallback_bytes = std::slice::from_raw_parts(
+                        fallback_blob.GetBufferPointer().cast::<u8>(),
+                        fallback_blob.GetBufferSize(),
+                    );
+                    let root = device.CreateRootSignature(0, fallback_bytes)?;
+                    (root, fallback_bytes.to_vec())
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+        Ok(root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_root_signature_serializes_and_creates() {
+        let Some(host) = crate::host::host() else { return };
+        let (root, bytes) = root_signature(&host.device, &[], &[], false).unwrap();
+        assert!(!bytes.is_empty());
+        let _ = root;
+        let (comp_root, comp_bytes) = root_signature(&host.device, &[], &[], true).unwrap();
+        assert!(!comp_bytes.is_empty());
+        let _ = comp_root;
     }
 }
