@@ -470,7 +470,9 @@ impl<'a> Lanes<'a> {
             self.first[b] = c;
             // EXEC joined at the block's entry holds the lanes that arrive.
             for phi in &p.blocks[b].phis {
-                if phi.reg == Reg::S(EXEC) {
+                if phi.reg == Reg::S(EXEC)
+                    || (!phi.args.is_empty() && phi.args.iter().all(|a| self.active.contains(a)))
+                {
                     self.active.insert(phi.value);
                 }
             }
@@ -576,10 +578,16 @@ impl<'a> Lanes<'a> {
             return Err(TOO_LARGE);
         }
         Ok(Structured {
-            masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            masks: self
+                .masks
+                .iter()
+                .chain(&self.other)
+                .map(|(&(lo, _), &m)| (lo, m))
+                .collect(),
             highs: self
                 .masks
                 .keys()
+                .chain(self.other.keys())
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),

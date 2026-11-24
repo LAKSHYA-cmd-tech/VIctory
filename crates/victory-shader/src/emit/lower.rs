@@ -1608,9 +1608,8 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
-            // With console lanes, a mask held as a number is the console's:
-            // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
+            // A mask held as a number: the lane tests its own bit.
+            Atom::Opaque(v) => {
                 let hi = match self.pair_high(v) {
                     Some(h) => Some(self.get(h)?),
                     None => None,
@@ -1624,13 +1623,15 @@ impl<'a> Lower<'a> {
                 let hi = hi.map(word).transpose()?;
                 Ok(self.lane_bit(at, lo, hi))
             }
-            Atom::Constant(k) if self.console_lanes => {
+            Atom::Constant(k) => {
                 let lo = self.s.m.i32(k as u32);
-                let hi = self.s.m.i32((k >> 32) as u32);
-                Ok(self.lane_bit(at, lo, Some(hi)))
+                let hi = if self.x.native.wave64 {
+                    Some(self.s.m.i32((k >> 32) as u32))
+                } else {
+                    None
+                };
+                Ok(self.lane_bit(at, lo, hi))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
-            Atom::Constant(_) => Err("a constant lane mask"),
         }
     }
 
@@ -3996,14 +3997,76 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
+                let cond = match v.src.get(2) {
+                    Some(&Operand::Scalar { code, .. }) => {
+                        let m = inst.read(Reg::S(code));
+                        if let Some(m) = m.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                            self.boolean(m, c)?
+                        } else if let Some(m) = m {
+                            let lo = match self.get(m)? {
+                                Val::Bit(b) => {
+                                    if v.abs != 0 || v.neg != 0 {
+                                        let (a, bb) = (f(self, 0)?, f(self, 1)?);
+                                        let r = self.s.m.select(c, b, bb, a);
+                                        return float(self, r);
+                                    } else {
+                                        let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                                        let r = self.s.m.select(c, b, bb, a);
+                                        return int(self, r);
+                                    }
+                                }
+                                Val::I32(x) => x,
+                                Val::Missing(w) => return Err(w),
+                            };
+                            let hi =
+                                self.pair_high(m)
+                                    .and_then(|h| self.get(h).ok())
+                                    .and_then(|w| match w {
+                                        Val::I32(x) => Some(x),
+                                        _ => None,
+                                    });
+                            self.lane_bit(c, lo, hi)
+                        } else {
+                            return Err("a select on an untracked mask");
+                        }
+                    }
+                    Some(&Operand::Const(k)) => {
+                        let val = if k <= 192 {
+                            i64::from(k) - 128
+                        } else {
+                            192 - i64::from(k)
+                        };
+                        if val == 0 {
+                            self.s.m.bool(false)
+                        } else if val == -1 || val == 1 {
+                            self.s.m.bool(true)
+                        } else {
+                            let lo = self.s.m.i32(val as u32);
+                            let hi = if self.x.native.wave64 {
+                                Some(self.s.m.i32((val >> 32) as u32))
+                            } else {
+                                None
+                            };
+                            self.lane_bit(c, lo, hi)
+                        }
+                    }
+                    Some(&Operand::Literal(lit)) => {
+                        if lit == 0 {
+                            self.s.m.bool(false)
+                        } else if lit == u32::MAX {
+                            self.s.m.bool(true)
+                        } else {
+                            let lo = self.s.m.i32(lit);
+                            let hi = if self.x.native.wave64 {
+                                Some(self.s.m.i32(0))
+                            } else {
+                                None
+                            };
+                            self.lane_bit(c, lo, hi)
+                        }
+                    }
+                    _ => return Err("a select on an untracked mask"),
                 };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
-                let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
@@ -4021,14 +4084,68 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                        _ => None,
+                    let cond = match v.src.get(2) {
+                        Some(&Operand::Scalar { code, .. }) => {
+                            let m = inst.read(Reg::S(code));
+                            if let Some(m) = m.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                                self.boolean(m, c)?
+                            } else if let Some(m) = m {
+                                match self.get(m)? {
+                                    Val::Bit(b) => b,
+                                    Val::I32(lo) => {
+                                        let hi = self
+                                            .pair_high(m)
+                                            .and_then(|h| self.get(h).ok())
+                                            .and_then(|w| match w {
+                                                Val::I32(x) => Some(x),
+                                                _ => None,
+                                            });
+                                        self.lane_bit(c, lo, hi)
+                                    }
+                                    Val::Missing(w) => return Err(w),
+                                }
+                            } else {
+                                return Err("a carry-in from an untracked mask");
+                            }
+                        }
+                        Some(&Operand::Const(k)) => {
+                            let val = if k <= 192 {
+                                i64::from(k) - 128
+                            } else {
+                                192 - i64::from(k)
+                            };
+                            if val == 0 {
+                                self.s.m.bool(false)
+                            } else if val == -1 || val == 1 {
+                                self.s.m.bool(true)
+                            } else {
+                                let lo = self.s.m.i32(val as u32);
+                                let hi = if self.x.native.wave64 {
+                                    Some(self.s.m.i32((val >> 32) as u32))
+                                } else {
+                                    None
+                                };
+                                self.lane_bit(c, lo, hi)
+                            }
+                        }
+                        Some(&Operand::Literal(lit)) => {
+                            if lit == 0 {
+                                self.s.m.bool(false)
+                            } else if lit == u32::MAX {
+                                self.s.m.bool(true)
+                            } else {
+                                let lo = self.s.m.i32(lit);
+                                let hi = if self.x.native.wave64 {
+                                    Some(self.s.m.i32(0))
+                                } else {
+                                    None
+                                };
+                                self.lane_bit(c, lo, hi)
+                            }
+                        }
+                        _ => return Err("a carry-in from an untracked mask"),
                     };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    Some(cond)
                 } else {
                     None
                 };
@@ -7084,5 +7201,25 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn cndmask_and_carry_in_lower_with_untracked_and_constant_masks() {
+        // v_cndmask_b32 with VCC, untracked SGPR mask, and inline constant mask.
+        let words = [
+            0xBE80_0381, // s_mov_b32 s0, 1
+            0x7E02_0280, // v_mov_b32_e32 v1, 0
+            0x7E04_0281, // v_mov_b32_e32 v2, 1
+            0x0202_0480, // v_cndmask_b32 v1, 0, v2, vcc_lo
+            // VOP3 v_cndmask_b32 v0, v1, v2, s0:
+            0xD501_0000,
+            0x0002_0501,
+            // VOP3 v_cndmask_b32 v0, v1, v2, 0:
+            0xD501_0000,
+            0x0002_0180,
+            S_ENDPGM,
+        ];
+        lowers(&words).unwrap();
+    }
     }
 }
