@@ -11,6 +11,11 @@
 //! descriptor's address itself. Each descriptor operand and each scalar
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
+//!
+//! A title can also pass a 64-bit address as two root constants, low half
+//! first, in consecutive user SGPRs (within one parameter or across two).
+//! Such a pair is recognised from its high half, which the code uses only
+//! as the high half of an address (or adds a carry to): [`Pair`].
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
@@ -26,10 +31,21 @@ pub type Site = (usize, usize);
 pub struct Address {
     /// Index into the layout, or [`CODE`].
     pub param: usize,
+    /// The dword of the base within `param`: 0 except for an address in
+    /// root constants ([`Pair`]), where it is the low half's.
+    pub dword: u32,
     /// Added modulo 2^32 (with carry into the high half of a root
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+}
+
+/// A 64-bit address in two root-constant dwords: layout index and dword
+/// of its low half and of its high half (the next user SGPR).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pair {
+    pub lo: (usize, u32),
+    pub hi: (usize, u32),
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -89,6 +105,8 @@ pub struct Resources {
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
+    /// The root-constant pairs the addresses above start from, once each.
+    pub pairs: Vec<Pair>,
 }
 
 /// Traces every descriptor and scalar address of `p`, which runs as
@@ -154,6 +172,18 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
             }
         }
     }
+    let built = out.descriptors.iter().flat_map(|d| {
+        d.source.leaves().into_iter().filter_map(|l| match l {
+            Source::Built { address, .. } => Some(*address),
+            _ => None,
+        })
+    });
+    let addresses: Vec<Address> = out.scalar.iter().map(|s| s.1).chain(built).collect();
+    for pair in addresses.into_iter().filter_map(|a| t.pair(a)) {
+        if !out.pairs.contains(&pair) {
+            out.pairs.push(pair);
+        }
+    }
     Ok(out)
 }
 
@@ -164,8 +194,8 @@ enum Term {
     Value(Value),
 }
 
-/// A 32-bit sum: optional root parameter (as its first dword), constant,
-/// optional computed term.
+/// A 32-bit sum: optional root parameter (as its first dword, or the low
+/// half of a [`Pair`]), constant, optional computed term.
 struct Sum {
     base: Option<Value>,
     offset: u32,
@@ -337,7 +367,9 @@ impl<'a> Tracer<'a> {
         ))
     }
 
-    fn sum(&self, t: Term) -> Sum {
+    /// The sum `t` computes; `pair`, the low half of a root-constant pair,
+    /// counts as a base too.
+    fn sum(&self, t: Term, pair: Option<Value>) -> Sum {
         let v = match t {
             Term::Const(c) => {
                 return Sum {
@@ -355,6 +387,11 @@ impl<'a> Tracer<'a> {
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
+                _ if pair == Some(v) => Sum {
+                    base: Some(v),
+                    offset: 0,
+                    dynamic: None,
+                },
                 Some((_, 0)) => Sum {
                     base: Some(v),
                     offset: 0,
@@ -377,7 +414,7 @@ impl<'a> Tracer<'a> {
         else {
             return dynamic;
         };
-        let (x, y) = (self.sum(a), self.sum(b));
+        let (x, y) = (self.sum(a, pair), self.sum(b, pair));
         if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
             return dynamic;
         }
@@ -465,7 +502,7 @@ impl<'a> Tracer<'a> {
                     return Err("an address not in SGPRs");
                 };
                 let v = inst.read(Reg::V(reg)).ok_or("a global address")?;
-                let mut extra = self.sum(self.vorigin(v));
+                let mut extra = self.sum(self.vorigin(v), None);
                 if extra.base.is_some() {
                     return Err("an offset from a root parameter");
                 }
@@ -493,7 +530,10 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
-        let s = self.sum(lo);
+        if let Some(a) = self.pair_address(lo, hi, &extra) {
+            return a;
+        }
+        let s = self.sum(lo, None);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
@@ -506,6 +546,7 @@ impl<'a> Tracer<'a> {
             }
             return Ok(Address {
                 param: CODE,
+                dword: 0,
                 offset: (pc.machine.offset as u32 + 4)
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
@@ -535,8 +576,88 @@ impl<'a> Tracer<'a> {
         }
         Ok(Address {
             param,
+            dword: 0,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+        })
+    }
+
+    /// The address a root-constant pair holds: `hi` is the pair's high half
+    /// (possibly plus a carry) and the sum of `lo` starts from its low half.
+    /// `None` when `lo` and `hi` are no pair; the other kinds of address
+    /// never have a root constant as their high half.
+    fn pair_address(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: &Sum,
+    ) -> Option<Result<Address, &'static str>> {
+        let (low, high) = self.pair_high(hi)?;
+        let s = self.sum(lo, Some(low));
+        if s.base != Some(low) {
+            return None;
+        }
+        let (param, dword) = self.param_of(self.inputs[low.0 as usize]?)?;
+        if s.dynamic.is_some() && extra.dynamic.is_some() {
+            return Some(Err("an address with two computed terms"));
+        }
+        let dynamic = s.dynamic.or(extra.dynamic);
+        if !self.high_half(hi, Some(high)) && !(dynamic.is_some() && self.carried(hi, high)) {
+            return Some(Err("an address with an untracked high half"));
+        }
+        Some(Ok(Address {
+            param,
+            dword,
+            offset: s.offset.wrapping_add(extra.offset),
+            dynamic,
+        }))
+    }
+
+    /// The root-constant input `hi` is, or adds a carry to (`s_addc_u32`,
+    /// `v_add_co_ci_u32`, as [`Tracer::carried`] walks), when the user SGPR
+    /// below it holds a root constant too: (low half, high half) on entry.
+    fn pair_high(&self, hi: Term) -> Option<(Value, Value)> {
+        let Term::Value(v) = hi else { return None };
+        if let Some(Reg::S(code)) = self.inputs[v.0 as usize] {
+            let below = code.checked_sub(1)?;
+            if !self.is_constant(code) || !self.is_constant(below) {
+                return None;
+            }
+            let low = self.p.inputs.iter().find(|i| i.0 == Reg::S(below))?.1;
+            return Some((low, v));
+        }
+        if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
+            return self.pair_high(a).or_else(|| self.pair_high(b));
+        }
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if inst.name() != "v_add_co_ci_u32" {
+            return None;
+        }
+        f.src[..2.min(f.src.len())]
+            .iter()
+            .find_map(|o| self.pair_high(self.vterm(inst, o)?))
+    }
+
+    /// User SGPR `code` holds a root-constant dword.
+    fn is_constant(&self, code: u8) -> bool {
+        self.param_of(Reg::S(code))
+            .is_some_and(|(i, _)| self.layout[i].root == RootType::Constants)
+    }
+
+    /// The pair an address in root constants starts from.
+    fn pair(&self, a: Address) -> Option<Pair> {
+        let rp = self.layout.get(a.param)?;
+        if rp.root != RootType::Constants {
+            return None;
+        }
+        let low = u32::from(self.stage.user_sgpr(rp.user_data)) + a.dword;
+        let high = u8::try_from(low + 1).ok()?;
+        Some(Pair {
+            lo: (a.param, a.dword),
+            hi: self.param_of(Reg::S(high))?,
         })
     }
 
@@ -619,6 +740,7 @@ impl<'a> Tracer<'a> {
         let mut extra = self.sum(
             self.term(inst, soffset)
                 .ok_or("an unknown offset operand")?,
+            None,
         );
         if extra.base.is_some() {
             return Err("an offset from a root parameter");
@@ -776,7 +898,7 @@ impl<'a> Tracer<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
 }
@@ -794,58 +916,78 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
-            .ok()
-            .flatten()
-    }
-
-    /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
-    /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
-        if let Some((b, i)) = self.phis[v.0 as usize] {
-            if seen.contains(&v) {
-                return Ok(None);
-            }
-            seen.push(v);
-            let mut found = None;
-            for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
-                    if found.is_some_and(|f| f != m) {
-                        return Err(());
-                    }
-                    found = Some(m);
-                }
-            }
-            return Ok(found);
-        }
-        let inst = self.def(v).ok_or(())?;
-        let Fields::Valu(w) = &inst.fields else {
-            return Err(());
-        };
-        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
-            return Err(());
-        };
-        if inst.name() != "v_writelane_b32" {
-            return Err(());
-        }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
-        }
-        match *value {
-            Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Moved::Value)
-            }
-            Operand::Literal(x) => Some(Moved::Const(x)),
-            Operand::Const(c) => inline(c).map(Moved::Const),
-            _ => None,
-        }
-        .map(Some)
-        .ok_or(())
+        spilled_lane(
+            self.p,
+            &|val| self.def(val),
+            &|val| self.phis[val.0 as usize],
+            inst.read(Reg::V(reg))?,
+            lane_of(lane)?,
+            &mut Vec::new(),
+        )
+        .ok()
+        .flatten()
     }
 }
 
+/// Traces lane `lane` of VGPR value `v` back through `v_writelane_b32` writes
+/// and VGPR phis to the spilled scalar or constant (`Ok(None)` for a phi cycle).
+pub(crate) fn spilled_lane<'a>(
+    p: &'a Program,
+    def_of: &impl Fn(Value) -> Option<&'a Inst>,
+    phi_of: &impl Fn(Value) -> Option<(usize, usize)>,
+    v: Value,
+    lane: u32,
+    seen: &mut Vec<Value>,
+) -> Result<Option<Moved>, ()> {
+    if let Some((b, i)) = phi_of(v) {
+        if seen.contains(&v) {
+            return Ok(None);
+        }
+        seen.push(v);
+        let mut found = None;
+        for &a in &p.blocks[b].phis[i].args {
+            if let Some(m) = spilled_lane(p, def_of, phi_of, a, lane, seen)? {
+                if found.is_some_and(|f| f != m) {
+                    return Err(());
+                }
+                found = Some(m);
+            }
+        }
+        return Ok(found);
+    }
+    let inst = def_of(v).ok_or(())?;
+    let Fields::Valu(w) = &inst.fields else {
+        return Err(());
+    };
+    let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+        return Err(());
+    };
+    if inst.name() != "v_writelane_b32" {
+        return Err(());
+    }
+    if lane_of(*at).ok_or(())? != lane {
+        return spilled_lane(
+            p,
+            def_of,
+            phi_of,
+            inst.read(Reg::V(reg)).ok_or(())?,
+            lane,
+            seen,
+        );
+    }
+    match *value {
+        Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)).map(Moved::Value),
+        Operand::Scalar { .. } => Some(Moved::Const(0)),
+        Operand::Literal(x) => Some(Moved::Const(x)),
+        Operand::Const(c) => inline(c).map(Moved::Const),
+        _ => None,
+    }
+    .map(Some)
+    .ok_or(())
+}
+
 /// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
+pub(crate) fn lane_of(op: Operand) -> Option<u32> {
     match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
@@ -855,6 +997,27 @@ fn lane_of(op: Operand) -> Option<u32> {
 
 /// What dword `k` of a move's result copies.
 fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
+    if let Fields::Valu(v) = &inst.fields {
+        if k != 0
+            || v.abs != 0
+            || v.neg != 0
+            || v.sdwa.is_some()
+            || v.dpp.is_some()
+            || !matches!(inst.name(), "v_mov_b32" | "v_readfirstlane_b32")
+        {
+            return None;
+        }
+        return match *v.src.first()? {
+            Operand::Scalar { code, .. } if code != NULL => {
+                inst.read(Reg::S(code)).map(Moved::Value)
+            }
+            Operand::Scalar { .. } => Some(Moved::Const(0)),
+            Operand::Vector { reg, .. } => inst.read(Reg::V(reg)).map(Moved::Value),
+            Operand::Literal(x) => Some(Moved::Const(x)),
+            Operand::Const(c) => inline(c).map(Moved::Const),
+            _ => None,
+        };
+    }
     let Fields::Sop { src, imm, .. } = &inst.fields else {
         return None;
     };
@@ -931,6 +1094,7 @@ mod tests {
     fn at(param: usize, offset: u32) -> Address {
         Address {
             param,
+            dword: 0,
             offset,
             dynamic: None,
         }
@@ -1112,5 +1276,146 @@ mod tests {
                 what: "an address in an SGPR that is no root parameter"
             }
         );
+    }
+
+    #[test]
+    fn descriptors_copied_through_vgprs_and_readfirstlane_are_tracked() {
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0201,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+                0x7E00_0208, // v_mov_b32 v0, s8
+                0x7E02_0209, // v_mov_b32 v1, s9
+                0x7E04_020A, // v_mov_b32 v2, s10
+                0x7E06_020B, // v_mov_b32 v3, s11
+                0x7E08_0500, // v_readfirstlane_b32 s4, v0
+                0x7E0A_0501, // v_readfirstlane_b32 s5, v1
+                0x7E0C_0502, // v_readfirstlane_b32 s6, v2
+                0x7E0E_0503, // v_readfirstlane_b32 s7, v3
+                0xF420_0002,
+                0xFA00_0000, // s_buffer_load_dword s0, s[4:7], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 2),
+                first: 0
+            }
+        );
+    }
+
+    /// `global_load_dword v1, v0, s[base:base+1]`.
+    fn global_load(base: u8) -> [u32; 2] {
+        [0xDC30_8000, 0x0100_0000 | u32::from(base) << 16]
+    }
+
+    /// The pair and the address of the one global load in `words`.
+    fn pair_load(words: &[u32], layout: &[RootParam]) -> (Vec<Pair>, Address) {
+        let r = track_words(words, layout, HwStage::Cs);
+        let [(_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        (r.pairs, a)
+    }
+
+    #[test]
+    fn root_constant_pairs_are_addresses() {
+        let [l0, l1] = global_load(0);
+        let (pairs, a) = pair_load(&[l0, l1, S_ENDPGM], &[param(Constants, 0, 2)]);
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 0),
+                hi: (0, 1)
+            }]
+        );
+        assert_eq!((a.param, a.dword, a.offset), (0, 0, 0));
+        assert!(a.dynamic.is_some(), "the VGPR offset is the computed term");
+    }
+
+    #[test]
+    fn a_root_constant_pair_at_a_later_dword() {
+        let [l0, l1] = global_load(2);
+        let (pairs, a) = pair_load(&[l0, l1, S_ENDPGM], &[param(Constants, 0, 4)]);
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 2),
+                hi: (0, 3)
+            }]
+        );
+        assert_eq!((a.param, a.dword), (0, 2));
+    }
+
+    #[test]
+    fn a_root_constant_pair_across_two_parameters() {
+        let [l0, l1] = global_load(2);
+        let (pairs, a) = pair_load(
+            &[l0, l1, S_ENDPGM],
+            &[param(Constants, 0, 3), param(Constants, 3, 1)],
+        );
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 2),
+                hi: (1, 0)
+            }]
+        );
+        assert_eq!((a.param, a.dword), (0, 2));
+    }
+
+    #[test]
+    fn a_root_constant_pair_plus_an_offset_with_its_carry() {
+        let (pairs, a) = pair_load(
+            &[
+                0xD70F_6A02,
+                0x0002_0000, // v_add_co_u32 v2, vcc_lo, s0, v0
+                0xD528_6A03,
+                0x01A9_0001, // v_add_co_ci_u32 v3, vcc_lo, s1, 0, vcc_lo
+                0xDC30_8000,
+                0x017D_0002, // global_load_dword v1, v[2:3], off
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2)],
+        );
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 0),
+                hi: (0, 1)
+            }]
+        );
+        assert_eq!((a.param, a.dword, a.offset), (0, 0, 0));
+        assert!(a.dynamic.is_some());
+    }
+
+    #[test]
+    fn a_root_constant_without_its_high_half_is_no_address() {
+        let [l0, l1] = global_load(0);
+        for hi in [
+            0xBE81_0303, // s_mov_b32 s1, s3: the high half of another pair
+            0xBE81_0380, // s_mov_b32 s1, 0: a 32-bit address
+        ] {
+            let code: Vec<u8> = [hi, l0, l1, S_ENDPGM]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let err = track(&p, &[param(Constants, 0, 4)], HwStage::Cs).unwrap_err();
+            assert_eq!(
+                err,
+                ShaderError::Unsupported {
+                    offset: 4,
+                    what: "an address from a root parameter that is no address"
+                },
+                "{hi:#x}"
+            );
+        }
     }
 }
