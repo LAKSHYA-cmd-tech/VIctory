@@ -142,6 +142,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, String> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        options: super::TranslateOptions::default(),
     })
     .map_err(|e| format!("{e:?}"))?;
 
@@ -1406,6 +1407,7 @@ fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
             outputs,
             prims: Vec::new(),
             mesh_stride: 0,
+            options: super::TranslateOptions::default(),
         })
         .expect("lower");
         let shader = HostShader {
@@ -1678,6 +1680,7 @@ fn try_build_image_store_cs(dmask: u8, d16: bool) -> Result<HostShader, crate::S
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        options: super::TranslateOptions::default(),
     })?;
 
     let shader = HostShader {
