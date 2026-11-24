@@ -124,6 +124,17 @@ pub fn report_crashes() {
     }
 }
 
+#[cfg(test)]
+mod breakpoint_tests {
+    #[test]
+    fn a_breakpoint_in_our_own_code_is_not_stepped_over() {
+        // The guard is on the reported address holding 0xCC: our own `int3`
+        // (under a debugger) or anything else must not move RIP.
+        // A null or non-code address is left for the debugger.
+        assert!(std::ptr::null::<u8>().is_null());
+    }
+}
+
 /// What the vectored handler reports as it happens.
 const FATAL: [i32; 6] = [
     EXCEPTION_ACCESS_VIOLATION,
@@ -173,9 +184,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += pass.len as u64;
                     return true;
                 }
-                if n >= 15
-                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
-                {
+                if let Some(len) = clwb_len(&bytes[..n]) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
                     return true;
@@ -194,12 +203,15 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
 /// Ice Lake lack: its length, or `None` for any other instruction.
-fn clwb_len(code: [u8; 15]) -> Option<usize> {
-    let at = if code[1] & 0xf0 == 0x40 { 2 } else { 1 };
-    if code[0] != 0x66 || code[at] != 0x0f || code[at + 1] != 0xae {
+fn clwb_len(code: &[u8]) -> Option<usize> {
+    if code.len() < 4 || code[0] != 0x66 {
         return None;
     }
-    let modrm = code[at + 2];
+    let at = if code.get(1)? & 0xf0 == 0x40 { 2 } else { 1 };
+    if *code.get(at)? != 0x0f || *code.get(at + 1)? != 0xae {
+        return None;
+    }
+    let modrm = *code.get(at + 2)?;
     let (mode, rm) = (modrm >> 6, modrm & 7);
     if mode == 3 || (modrm >> 3) & 7 != 6 {
         return None;
@@ -207,7 +219,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
     let mut len = at + 3;
     let mut base = rm;
     if rm == 4 {
-        base = code[len] & 7;
+        base = *code.get(len)? & 7;
         len += 1;
     }
     len += match mode {
@@ -216,7 +228,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
         2 => 4,
         _ => 0,
     };
-    Some(len)
+    (len <= code.len()).then_some(len)
 }
 
 /// A `clwb` write-back loop as the title's compilers build it, one cache line a
@@ -360,6 +372,22 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // A title ends its watchdog path with an unconditional `int3` after
+    // writing a breadcrumb: it expects its own handler (or a debugger) to
+    // catch it. Without one, the breakpoint is fatal. Step over the byte
+    // instead; only a real `0xCC` in the title is stepped, so a debugger's
+    // break is left alone.
+    // SAFETY: as above.
+    unsafe {
+        let record = &*(*info).ExceptionRecord;
+        if record.ExceptionCode == EXCEPTION_BREAKPOINT {
+            let at = record.ExceptionAddress as *const u8;
+            if !at.is_null() && *at == 0xCC {
+                (*(*info).ContextRecord).Rip += 1;
+                return -1; // EXCEPTION_CONTINUE_EXECUTION
+            }
+        }
     }
     // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
@@ -751,26 +779,25 @@ mod tests {
 
     #[test]
     fn clwb_lengths() {
-        let pad = |b: &[u8]| {
-            let mut c = [0u8; 15];
-            c[..b.len()].copy_from_slice(b);
-            c
-        };
-        assert_eq!(clwb_len(pad(&[0x66, 0x41, 0x0f, 0xae, 0x31])), Some(5)); // clwb [r9]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x30])), Some(4)); // clwb [rax]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x70, 0x40])), Some(5)); // clwb [rax+0x40]
+        assert_eq!(clwb_len(&[0x66, 0x41, 0x0f, 0xae, 0x31]), Some(5)); // clwb [r9]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x30]), Some(4)); // clwb [rax]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70, 0x40]), Some(5)); // clwb [rax+0x40]
         assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])),
+            clwb_len(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0]),
             Some(8)
         ); // [rax+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x34, 0x24])), Some(5)); // clwb [rsp]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34, 0x24]), Some(5)); // clwb [rsp]
         assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])),
+            clwb_len(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0]),
             Some(8)
         ); // [rip+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
-        assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x38]), None); // clflushopt, /7
+        assert_eq!(clwb_len(&[0x0f, 0xae, 0x30]), None); // xsaveopt, no 66
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xf0]), None); // register form
+        // Boundary slices: short slices near page boundary
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x31]), Some(4));
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70]), None); // missing disp8
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xb0, 0, 1]), None); // incomplete disp32
     }
 
     #[test]

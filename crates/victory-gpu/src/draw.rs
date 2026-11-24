@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::{AddressView, UserData};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -20,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
 use crate::host::HostList;
+use crate::indirect::{self, DISPATCH, DRAW, INDEXED, MESH};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -38,9 +40,9 @@ enum Root {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
-    address: u64,
-    size: u32,
-    stride: u32,
+    pub(crate) address: u64,
+    pub(crate) size: u32,
+    pub(crate) stride: u32,
 }
 
 #[repr(C)]
@@ -74,16 +76,20 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds (title heap, first, count), given
+    /// back when the list is reset or released, or earlier when a heap runs
+    /// short after the list ran (see [`crate::descriptor::lease`]).
+    lease: std::sync::Arc<crate::descriptor::lease::Lease>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// Root SRVs bound as one-view tables in this list: (host heap, title
+    /// address) → dynamic slot.
+    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for (heap, first, n) in self.lease.take() {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
@@ -136,19 +142,67 @@ pub(crate) fn dispatched() -> u64 {
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
+/// How far past a root SRV the title's shaders may read. A root SRV is a bare
+/// address with no bounds, and the world's mesh shaders fetch vertices
+/// through one megabytes past where it points, past the end of the title
+/// buffer it lies in: on the console that is more title memory, on the host
+/// the end of that buffer's copy, and an NVIDIA GPU faults there (Aftermath
+/// on an RTX 3080: reads 3 MB and 16 MB past copies, one inside a freed
+/// texture placed next to the copy).
+const ROOT_SRV_REACH: u64 = 32 << 20;
+
+fn root_srv_reach() -> u64 {
+    // Diagnostics: VICTORY_ROOT_REACH_MB (0 = as before).
+    #[cfg(feature = "diagnostics")]
+    if let Some(mb) = std::env::var("VICTORY_ROOT_REACH_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return mb << 20;
+    }
+    ROOT_SRV_REACH
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
+    let mut shadow = crate::shadow::find(address, 1)?;
+    let mut len = shadow
         .left(address)
         .min(if srv { 1 << 20 } else { 1 << 16 });
+    let reach = root_srv_reach();
+    if srv && reach > 0 && shadow.left(address) < reach {
+        // A copy holding the whole reach: a bigger title buffer around it,
+        // else title memory copied as is.
+        if let Some(wide) = crate::shadow::find_wide(address, reach) {
+            shadow = wide;
+            len = reach;
+        }
+    }
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
+}
+
+/// Addresses below this are taken as unset (null, or no buffer): a root SRV
+/// at an address in root constants is not bound there and its draw is
+/// dropped.
+const MIN_ADDRESS: u64 = 0x1_0000;
+
+/// The address a root SRV at an address in root constants starts at: the
+/// two constants' current values, low half first. `None` when the title has
+/// not set either or the address is below [`MIN_ADDRESS`].
+fn pair_address(roots: &[Root], view: &AddressView) -> Option<u64> {
+    let half = |u: &UserData| match roots.get(usize::from(u.slot))? {
+        Root::Constants(c) => c.get(u.dword as usize).copied(),
+        _ => None,
+    };
+    let address = u64::from(half(&view.lo)?) | u64::from(half(&view.hi)?) << 32;
+    (address >= MIN_ADDRESS).then_some(address)
 }
 
 macro_rules! once {
@@ -170,6 +224,44 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// The list's slots, to start and finish its submissions.
+    pub(crate) fn lease(&self) -> &std::sync::Arc<crate::descriptor::lease::Lease> {
+        &self.lease
+    }
+
+    /// `n` consecutive dynamic slots of `host` (the host heap of the title
+    /// heap at address `key`), held by this list. When the heap has no room,
+    /// the slots of the oldest list that already ran are taken back first,
+    /// one list at a time, instead of dropping the draw.
+    fn take_dynamic(
+        &mut self,
+        host: &crate::descriptor::host::HostHeap,
+        key: usize,
+        n: u32,
+    ) -> Option<u32> {
+        let mut reclaimed = false;
+        loop {
+            if let Some(first) = host.dynamic(n) {
+                self.lease.add(key, first, n);
+                return Some(first);
+            }
+            let more = crate::descriptor::lease::reclaim(key, |(heap, first, n)| {
+                if heap == key {
+                    host.release(first, n);
+                } else {
+                    crate::descriptor::release_dynamic(heap, first, n);
+                }
+            });
+            if !more {
+                return None;
+            }
+            if !reclaimed {
+                reclaimed = true;
+                once!("dynamic descriptor slots of lists that already ran are taken back");
+            }
+        }
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -245,7 +337,12 @@ impl State {
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
-        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
             *slot = VertexView::default();
         }
     }
@@ -294,6 +391,23 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+    }
+
+    /// The value of user-data dword `u` of a translated shader: a root
+    /// argument, or a bound heap's guard slot.
+    fn user_dword(&self, compute: bool, u: &victory_shader::emit::UserData) -> u32 {
+        let guard = |samplers: bool| {
+            let h = self.heaps[usize::from(samplers)];
+            (h != 0)
+                .then(|| crate::descriptor::heap(h as This).host())
+                .flatten()
+                .map_or(0, |h| h.guard_slot())
+        };
+        match u.root {
+            RootType::ResourceHeap => guard(false),
+            RootType::SamplerHeap => guard(true),
+            _ => self.user_value(compute, u.slot, u.root, u.dword),
+        }
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -349,7 +463,10 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            once!(
+                mesh,
+                "a draw or mesh dispatch with another kind of pipeline"
+            );
             return false;
         }
         if !self.bind(list, p, false) {
@@ -371,6 +488,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -389,6 +508,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -412,10 +532,10 @@ impl State {
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a table it reads could
-    /// not be made.
+    /// descriptors its tables hold. False if a root SRV at an address in
+    /// root constants has no address to bind: the draw cannot run.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let mut bound = true;
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -479,7 +599,7 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => self.user_dword(compute, u),
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -493,12 +613,23 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
+                        // An unset table is undefined: a null view instead.
+                        if tabled && !self.root_srv_table(list, None, param, compute) {
+                            return false;
+                        }
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    if tabled {
+                        if !self.root_srv_table(list, Some(address), param, compute) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    let Some(gpu) = root_view(list, address, srv) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -511,6 +642,114 @@ impl State {
                         }
                     }
                 }
+            }
+            for &(view, param) in &stage.address_srvs {
+                let gpu = pair_address(self.roots_ref(compute), &view)
+                    .and_then(|address| root_view(list, address, true));
+                let Some(gpu) = gpu else {
+                    once!(
+                        slot = view.lo.slot,
+                        dword = view.lo.dword,
+                        "a shader reads through an address in root constants that is unset; draw dropped"
+                    );
+                    bound = false;
+                    continue;
+                };
+                // SAFETY: an open list; the address is in live memory.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
+                }
+            }
+            if let Some(param) = stage.stride_table {
+                let gpu = (self.heaps[0] != 0)
+                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                    .flatten()
+                    .and_then(|h| h.stride_table_gpu());
+                if let Some(gpu) = gpu {
+                    // SAFETY: an open list; the stride table buffer lives with the host heap.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootShaderResourceView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootShaderResourceView(param, gpu);
+                        }
+                    }
+                } else {
+                    once!("a shader reads the runtime stride table without a host view heap");
+                    return false;
+                }
+            }
+        }
+        bound
+    }
+
+    /// Binds a root SRV as a one-view table (see
+    /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
+    /// title buffer's host copy from `address` to the copy's end, or a null
+    /// view (no address, or no host copy). One slot per address per list.
+    /// False if no dynamic slot could be had (the draw is dropped).
+    fn root_srv_table(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+        param: u32,
+        compute: bool,
+    ) -> bool {
+        let Some((heap, host)) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
+        else {
+            once!("a root SRV without a bound view heap: the draw is dropped");
+            return false;
+        };
+        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        let index = match self.root_srv_slots.get(&key) {
+            Some(&index) => index,
+            None => {
+                let Some(index) = self.take_dynamic(host, key.0, 1) else {
+                    return false;
+                };
+                self.root_srv_slots.insert(key, index);
+                match &shadow {
+                    Some((a, s)) => {
+                        // SAFETY: a live buffer.
+                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+                        let offset = s.gpu(*a) - base;
+                        if offset.is_multiple_of(16) {
+                            host.raw_at(index, &s.buffer, offset, s.left(*a));
+                        } else {
+                            // Raw views start on 16 bytes; one from the
+                            // aligned start would shift every read.
+                            once!(
+                                address = format_args!("{a:#x}"),
+                                "a root SRV not on 16 bytes reads zeros"
+                            );
+                            host.null_raw_at(index);
+                        }
+                    }
+                    None => host.null_raw_at(index),
+                }
+                index
+            }
+        };
+        if let Some((a, s)) = &shadow {
+            s.refresh(list, *a, s.left(*a).min(1 << 20));
+        }
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
         true
@@ -540,6 +779,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -567,7 +808,7 @@ impl State {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let v = self.user_value(compute, u.slot, u.root, u.dword);
+                let v = self.user_dword(compute, u);
                 let _ = write!(text, " u{}={v:#x}", u.index);
                 let index = if u.root == RootType::Table { v / 32 } else { v };
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
@@ -580,6 +821,16 @@ impl State {
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
                 }
+            }
+            for (view, _) in &stage.address_srvs {
+                let address = pair_address(self.roots_ref(compute), view);
+                let host =
+                    address.and_then(|a| crate::shadow::find(a, 1).map(|s| (s.gpu(a), s.left(a))));
+                let _ = write!(
+                    text,
+                    " u{}:u{}={address:#x?} host {host:#x?}",
+                    view.lo.index, view.hi.index
+                );
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
@@ -670,7 +921,7 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if !heap.samplers() && index >= host.count() {
                 fresh.push(u.slot);
             }
         }
@@ -723,7 +974,10 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = self
+                .take_dynamic(host, std::ptr::from_ref(heap) as usize, n)
+                .or_else(|| host.recycle_dynamic(n))
+            else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
@@ -733,15 +987,13 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
+                    Some(View::Constant(address, size)) if address != 0 => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -958,16 +1210,13 @@ impl State {
 }
 
 impl State {
-    /// Indirect execution of a one-argument signature of `kind` (PC
-    /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
-    /// records `stride` bytes apart at title address `arguments`, and the
-    /// record count at `count` if the title gives one: the GPU reads them
-    /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// Runs packed records `stride` bytes apart at `arguments`, with an
+    /// optional record count at `count`. The GPU reads the host copies,
+    /// where earlier dispatches may have written the records.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
-        (kind, stride, max): (u32, u32, u32),
+        (guest_args, stride, max): (&[[u32; 4]], u32, u32),
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
@@ -977,10 +1226,30 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        const DRAW: u32 = 0;
-        const INDEXED: u32 = 1;
-        const DISPATCH: u32 = 2;
-        const MESH: u32 = 10;
+        let pipeline = if guest_args.len() > 1 {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+        } else {
+            None
+        };
+        let stages = pipeline
+            .into_iter()
+            .flat_map(|p| &p.stages)
+            .filter_map(|stage| {
+                Some((
+                    stage.user_data?,
+                    stage.translated().host.user_data.as_slice(),
+                ))
+            });
+        let Some(layout) = map_indirect_args(guest_args, stride, stages) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("unsupported indirect signature {guest_args:?}"));
+            return false;
+        };
+        let IndirectLayout {
+            kind,
+            offset,
+            constants,
+        } = layout;
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -1000,10 +1269,81 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        if kind == INDEXED && self.topology == RECTANGLES {
+            once!("indirect indexed rectangles not drawn");
+            why("indexed rectangles not supported");
+            return false;
+        }
+        if kind == DRAW && self.topology == RECTANGLES {
+            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_drop(self.pipeline as This);
+                return false;
+            };
+            if p.compute || p.mesh {
+                why(&format!(
+                    "pipeline mismatch (compute {}, mesh {}, topology {})",
+                    p.compute, p.mesh, self.topology
+                ));
+                return false;
+            }
+            let Some(signature) = host_signature(DRAW, 16) else {
+                why("no host signature");
+                return false;
+            };
+            if max == 0 {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            let prepared = match crate::rectangles::expand(
+                list,
+                p,
+                &self.vertex,
+                (&args, arguments, stride, max),
+                counter.as_ref().map(|(s, at)| (s, *at)),
+            ) {
+                Ok(p) => p,
+                Err(reason) => {
+                    why(reason);
+                    return false;
+                }
+            };
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            if !self.prepare(list, false) {
+                why("prepare failed for indirect rectangles");
+                return false;
+            }
+            prepared.before_draw(list);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                self.op_text(
+                    format!("indirect rect draw max {max} at {arguments:#x}"),
+                    false,
+                )
+            });
+            // SAFETY: an open list with everything set; `prepared.args_buf` is
+            // list-owned (records past the title's count are empty draws, so
+            // no count buffer), the signature cached.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &prepared.args_buf,
+                    0,
+                    None::<&ID3D12Resource>,
+                    0,
+                )
+            };
+            prepared.after_draw(list);
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        let signature = match pipeline {
+            Some(p) => host_signature_with_constants(&p.root, kind, stride, &constants),
+            None => host_signature(kind, stride),
+        };
+        let Some(signature) = signature else {
             why("no host signature");
             return false;
         };
@@ -1012,14 +1352,19 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        if !indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max, offset),
+        ) {
+            why("not bounded (no clamp, or invalid argument layout)");
             return false;
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1028,31 +1373,47 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {})",
+                    p.compute, p.mesh
+                )),
             }
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
-        });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
             )
-        };
-        crate::indirect::done(list, &args.buffer);
+        });
+        if !constants.is_empty() {
+            // The cache can evict this signature before the list runs.
+            list.keep(&signature);
+        }
+        // SAFETY: an open list with everything set; the buffers are host
+        // copies the list keeps alive (refresh), and the signature is live.
+        crate::indirect::execute(
+            list,
+            &signature,
+            max,
+            (&args.buffer, args.offset(arguments)),
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+        );
+        // ExecuteIndirect zeroes the constants it sets. Mirror that in
+        // the title state so the next bind doesn't restore stale values.
+        for &[_, slot, dest, dwords] in &guest_args[..guest_args.len() - 1] {
+            if let Some(Root::Constants(values)) =
+                self.roots(kind == DISPATCH).get_mut(slot as usize)
+                && let Some(tail) = values.get_mut(dest as usize..)
+            {
+                let len = tail.len().min(dwords as usize);
+                tail[..len].fill(0);
+            }
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1060,6 +1421,86 @@ impl State {
         }
         true
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IndirectLayout {
+    kind: u32,
+    offset: u32,
+    /// Host root parameter, destination dword, and dword count per argument.
+    constants: Vec<[u32; 3]>,
+}
+
+fn map_indirect_args<'a>(
+    args: &[[u32; 4]],
+    stride: u32,
+    stages: impl Iterator<Item = ((u32, u32), &'a [UserData])> + Clone,
+) -> Option<IndirectLayout> {
+    const CONSTANT: u32 = 5;
+    const DISPATCH_SINGLE: u32 = 105;
+    let (&[action, ..], prefix) = args.split_last()?;
+    let kind = if action == DISPATCH_SINGLE {
+        DISPATCH
+    } else {
+        action
+    };
+    let offset = prefix
+        .iter()
+        .try_fold(0u32, |offset, &[ty, _, dest, dwords]| {
+            if ty != CONSTANT || dwords == 0 {
+                return None;
+            }
+            dest.checked_add(dwords - 1)?;
+            offset.checked_add(dwords.checked_mul(4)?)
+        })?;
+    if !indirect::fits_record(kind, stride, offset) {
+        return None;
+    }
+
+    let mut constants = Vec::<[u32; 3]>::new();
+    let mut previous = None;
+    for &[_, slot, dest, dwords] in prefix {
+        let first = constants.len();
+        for k in 0..dwords {
+            let guest_dword = dest + k;
+            let mut matches = stages.clone().flat_map(|((param, size), data)| {
+                data.iter()
+                    .filter(move |u| {
+                        u32::from(u.slot) == slot
+                            && u.root == RootType::Constants
+                            && u.dword == guest_dword
+                    })
+                    .map(move |u| (param, size, u.index))
+            });
+            let (param, size, index) = matches.next()?;
+            if index >= size || matches.next().is_some() {
+                return None;
+            }
+            // D3D12 requires sorted root parameters and non-overlapping,
+            // increasing offsets within each parameter. Reordering would
+            // change which values the packed record supplies.
+            let destination = (param, index);
+            if previous.is_some_and(|previous| destination <= previous) {
+                return None;
+            }
+            previous = Some(destination);
+            // Keep the record packed. A break in the destination range
+            // starts another descriptor at the next dword in the record.
+            if let Some([previous, start, count]) = constants[first..].last_mut()
+                && *previous == param
+                && start.checked_add(*count) == Some(index)
+            {
+                *count += 1;
+            } else {
+                constants.push([param, index, 1]);
+            }
+        }
+    }
+    Some(IndirectLayout {
+        kind,
+        offset,
+        constants,
+    })
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -1072,50 +1513,133 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
         return Some(s.clone());
     }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+    let signature = create_host_signature(None, kind, stride, &[])?;
+    made.push(((kind, stride), signature.clone()));
+    Some(signature)
+}
+
+struct RootCommandSignature {
+    root: ID3D12RootSignature,
+    kind: u32,
+    stride: u32,
+    constants: Vec<[u32; 3]>,
+    signature: ID3D12CommandSignature,
+}
+
+fn host_signature_with_constants(
+    root: &ID3D12RootSignature,
+    kind: u32,
+    stride: u32,
+    constants: &[[u32; 3]],
+) -> Option<ID3D12CommandSignature> {
+    const CAPACITY: usize = 64;
+    // Hold the root reference so its address cannot be reused while cached.
+    static MADE: std::sync::Mutex<std::collections::VecDeque<RootCommandSignature>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = made.iter().find(|entry| {
+        &entry.root == root
+            && entry.kind == kind
+            && entry.stride == stride
+            && entry.constants == constants
+    }) {
+        return Some(entry.signature.clone());
+    }
+    let signature = create_host_signature(Some(root), kind, stride, constants)?;
+    if made.len() == CAPACITY {
+        made.pop_front();
+    }
+    made.push_back(RootCommandSignature {
+        root: root.clone(),
+        kind,
+        stride,
+        constants: constants.to_vec(),
+        signature: signature.clone(),
+    });
+    Some(signature)
+}
+
+fn create_host_signature(
+    root: Option<&ID3D12RootSignature>,
+    kind: u32,
+    stride: u32,
+    constants: &[[u32; 3]],
+) -> Option<ID3D12CommandSignature> {
+    let action = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
         ..Default::default()
     };
+    let mut arguments = Vec::new();
+    let args = if constants.is_empty() {
+        std::slice::from_ref(&action)
+    } else {
+        arguments.extend(constants.iter().map(|&[param, dest, count]| {
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                        RootParameterIndex: param,
+                        DestOffsetIn32BitValues: dest,
+                        Num32BitValuesToSet: count,
+                    },
+                },
+            }
+        }));
+        arguments.push(action);
+        arguments.as_slice()
+    };
     let desc = D3D12_COMMAND_SIGNATURE_DESC {
         ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
+        NumArgumentDescs: args.len() as u32,
+        pArgumentDescs: args.as_ptr(),
         NodeMask: 0,
     };
     let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
+    // SAFETY: the descriptors live through the call, with the matching
+    // root signature when there are root arguments.
     let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
+        crate::host::host()?
+            .device
+            .CreateCommandSignature(&desc, root, &mut signature)
     };
     if let Err(e) = result {
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    signature
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+pub(crate) fn readable(list: &HostList, u: &UsedResource, view: &View) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
+    // A view off its buffer copy's elements uses its own copy of just its
+    // bytes: a host copy like any other, so its own refresh brings it up to
+    // date from title memory (which the last submission's copy-back already
+    // wrote), and what shaders write in it goes back from it.
+    // shortcut: such a copy is brought up to date from title memory when the
+    // submission is prepared, so it does not see what a shader of the same
+    // submission wrote in that range through another view, nor do they see
+    // its writes until the next one. Getting that right needs every host
+    // buffer's state tracked across the submission (PR #334), so that the
+    // bytes can be copied on the GPU inside the list instead.
     if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
         && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
+        && let Some(copy) = crate::shadow::aligned_existing(address, len)
+            .filter(|_| crate::descriptor::host::off_element(view))
+            .or_else(|| crate::shadow::find(address, len))
     {
-        shadow.refresh(list, address, len);
+        copy.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
-            shadow.gpu_writes(list, address, len);
+            copy.gpu_writes(list, address, len);
+            list.buffer_state(&copy.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            list.buffer_state(&copy.buffer, crate::host::BUFFER_READ);
         }
     }
     match (view, u.kind) {
@@ -1155,7 +1679,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {
@@ -1178,14 +1705,26 @@ fn describe(view: Option<&View>) -> String {
         ),
         // The first four values, as a colour rectangle's constants are.
         Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
+            if *size >= 16 && let Some(w) = first_words(*address) =>
         {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
+            let v: [f32; 4] = std::array::from_fn(|i| {
+                f32::from_le_bytes(w[4 * i..4 * i + 4].try_into().unwrap_or_default())
+            });
             format!("Constant({address:#x}, {size}) {v:?}")
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
+}
+
+/// The first 16 bytes of title memory at `at`, if readable. Read through
+/// the kernel, which fails on an unmapped page: asking `VirtualQuery`
+/// first walks the title's big pools' pages, about a millisecond each, and
+/// a world frame's command texts asked it thousands of times (seconds per
+/// frame on each recording thread with device-removed data on).
+#[cfg(feature = "diagnostics")]
+fn first_words(at: u64) -> Option<[u8; 16]> {
+    let mut w = [0u8; 16];
+    (at != 0 && crate::host::read_into(at as *const u8, &mut w)).then_some(w)
 }
 
 /// The console's own primitive topologies.
@@ -1214,4 +1753,379 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor::host::HostHeap;
+
+    /// The dynamic slots of an empty heap (and the heap left empty).
+    fn capacity(heap: &HostHeap) -> u32 {
+        let mut n = 0;
+        while heap.dynamic(1).is_some() {
+            n += 1;
+        }
+        heap.release(heap.count(), n);
+        n
+    }
+
+    /// A heap with no room takes back the slots of a list that already ran,
+    /// not of one that has not, and the list that lost them is refused.
+    #[test]
+    fn a_full_heap_takes_back_the_slots_of_a_list_that_ran() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let key = 0x2000_0001;
+        let total = capacity(&heap);
+        let chunk = 1000;
+        let mut ran = State::default();
+        let mut taken = 0;
+        while ran.take_dynamic(&heap, key, chunk).is_some() {
+            taken += chunk;
+        }
+        assert!(taken >= total - chunk, "the list filled the heap");
+        // Nothing has run yet: nothing is given back and the draw is dropped.
+        let mut other = State::default();
+        assert_eq!(other.take_dynamic(&heap, key, chunk), None);
+        assert!(!ran.lease().is_lost());
+        // The list ran: its slots serve the next list, once.
+        assert!(ran.lease().start());
+        ran.lease().finish();
+        assert!(other.take_dynamic(&heap, key, chunk).is_some());
+        assert!(ran.lease().is_lost());
+        assert!(
+            !ran.lease().start(),
+            "a list that lost its slots must not run"
+        );
+        // Everything of the first list is free again except what the other
+        // list now holds, and nothing was given back twice.
+        assert!(ran.lease().take().is_empty());
+        assert_eq!(capacity_left(&heap), total - chunk);
+        // Another request finds no finished list left and is dropped.
+        let mut third = State::default();
+        assert_eq!(third.take_dynamic(&heap, key, total), None);
+    }
+
+    /// Free slots of the heap now (taken and released again).
+    fn capacity_left(heap: &HostHeap) -> u32 {
+        capacity(heap)
+    }
+
+    /// A list that is running when another needs room keeps its slots; a
+    /// list reset by the title gives back its own and is not taken twice.
+    #[test]
+    fn a_running_or_reset_list_is_not_taken_back() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let key = 0x2000_0002;
+        let total = capacity(&heap);
+        let mut running = State::default();
+        let first = running.take_dynamic(&heap, key, total).unwrap();
+        assert_eq!(first, heap.count());
+        running.lease().finish();
+        // Submitted again: it is running and cannot be taken back.
+        assert!(running.lease().start());
+        let mut other = State::default();
+        assert_eq!(other.take_dynamic(&heap, key, 1), None);
+        assert!(!running.lease().is_lost());
+        // It ran: now it can, whole.
+        running.lease().finish();
+        assert_eq!(other.take_dynamic(&heap, key, 1), Some(heap.count()));
+        assert!(running.lease().is_lost());
+        // A lease reset by the title (its slots taken, as `Drop` does) is
+        // skipped: nothing is held, so nothing is taken back.
+        let mut reset = State::default();
+        assert!(reset.take_dynamic(&heap, key, 1).is_some());
+        reset.lease().finish();
+        assert_eq!(reset.lease().take().len(), 1);
+        let mut last = State::default();
+        assert_eq!(last.take_dynamic(&heap, key, total), None);
+        assert!(!reset.lease().is_lost());
+    }
+
+    fn half(slot: u8, dword: u32) -> UserData {
+        UserData {
+            index: 0,
+            slot,
+            root: RootType::Constants,
+            dword,
+        }
+    }
+
+    /// The low half at dword 1 of root parameter 0, the high half at dword 0
+    /// of parameter 2.
+    fn view() -> AddressView {
+        AddressView {
+            lo: half(0, 1),
+            hi: half(2, 0),
+        }
+    }
+
+    fn roots(lo: u32, hi: u32) -> Vec<Root> {
+        vec![
+            Root::Constants(vec![7, lo]),
+            Root::None,
+            Root::Constants(vec![hi]),
+        ]
+    }
+
+    #[test]
+    fn addresses_in_root_constants_are_composed_from_both_halves() {
+        assert_eq!(
+            pair_address(&roots(0x2345_0000, 1), &view()),
+            Some(0x1_2345_0000)
+        );
+        assert_eq!(pair_address(&roots(0x1_0000, 0), &view()), Some(0x1_0000));
+    }
+
+    #[test]
+    fn an_address_with_a_missing_half_is_unset() {
+        let set = roots(0x2345_0000, 1);
+        assert_eq!(pair_address(&set[..2], &view()), None);
+        let mut no_high = set.clone();
+        no_high[2] = Root::Constants(Vec::new());
+        assert_eq!(pair_address(&no_high, &view()), None);
+        let mut not_constants = set.clone();
+        not_constants[0] = Root::View(0x1_0000_0000);
+        assert_eq!(pair_address(&not_constants, &view()), None);
+        let mut short = set;
+        short[0] = Root::Constants(vec![7]);
+        assert_eq!(pair_address(&short, &view()), None);
+    }
+
+    #[test]
+    fn null_and_low_addresses_are_unset() {
+        assert_eq!(pair_address(&roots(0, 0), &view()), None);
+        assert_eq!(pair_address(&roots(0xFFFF, 0), &view()), None);
+    }
+}
+
+#[cfg(test)]
+mod indirect_tests {
+    use super::*;
+
+    fn user_data(slot: u8, dword: u32, index: u32) -> UserData {
+        UserData {
+            slot,
+            dword,
+            index,
+            root: RootType::Constants,
+        }
+    }
+
+    #[test]
+    fn maps_contiguous_constants_and_normalizes_dispatch_single() {
+        let data = [user_data(7, 3, 1), user_data(7, 4, 2), user_data(1, 0, 3)];
+        let stages = [((4, 4), data.as_slice())];
+        let args = [[5, 7, 3, 2], [5, 1, 0, 1], [105, 0, 0, 0]];
+
+        assert_eq!(
+            map_indirect_args(&args, 28, stages.into_iter()),
+            Some(IndirectLayout {
+                kind: DISPATCH,
+                offset: 12,
+                constants: vec![[4, 1, 2], [4, 3, 1]]
+            }),
+        );
+        assert_eq!(
+            map_indirect_args(&args[2..], 12, std::iter::empty()),
+            Some(IndirectLayout {
+                kind: DISPATCH,
+                offset: 0,
+                constants: vec![]
+            }),
+        );
+    }
+
+    #[test]
+    fn splits_noncontiguous_constants_in_record_order() {
+        let vs = [user_data(1, 2, 0), user_data(1, 3, 3)];
+        let ps = [user_data(1, 4, 1)];
+        let stages = [((0, 4), vs.as_slice()), ((2, 2), ps.as_slice())];
+        let args = [[5, 1, 2, 3], [DRAW, 0, 0, 0]];
+        let layout = map_indirect_args(&args, 28, stages.into_iter()).unwrap();
+
+        assert_eq!(layout.offset, 12);
+        assert_eq!(layout.constants, [[0, 0, 1], [0, 3, 1], [2, 1, 1]]);
+    }
+
+    #[test]
+    fn rejects_overlapping_or_out_of_order_destinations() {
+        let first = [user_data(1, 0, 3)];
+        let second = [user_data(1, 1, 0)];
+        let third = [user_data(1, 1, 3)];
+        let args = [[5, 1, 0, 2], [DISPATCH, 0, 0, 0]];
+        for stages in [
+            [((0, 4), first.as_slice()), ((0, 4), second.as_slice())],
+            [((2, 4), first.as_slice()), ((1, 4), second.as_slice())],
+            [((0, 4), first.as_slice()), ((0, 4), third.as_slice())],
+        ] {
+            assert!(map_indirect_args(&args, 20, stages.into_iter()).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_unmapped_and_aliased_constants() {
+        let args = [[5, 1, 0, 2], [INDEXED, 0, 0, 0]];
+        let vs = [user_data(1, 0, 0), user_data(1, 1, 1)];
+        let ps = [user_data(1, 1, 0)];
+        let table = [UserData {
+            root: RootType::Table,
+            ..vs[1]
+        }];
+        for stages in [
+            [((0, 2), &vs[..1]), ((2, 2), table.as_slice())],
+            [((0, 2), vs.as_slice()), ((2, 1), ps.as_slice())],
+            [((0, 1), vs.as_slice()), ((2, 0), &[])],
+        ] {
+            assert!(map_indirect_args(&args, 28, stages.into_iter()).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_and_malformed_record_layouts() {
+        let data = [user_data(1, 0, 0)];
+        let stages = [((0, 1), data.as_slice())];
+        let action = [DRAW, 0, 0, 0];
+        let constant = [5, 1, 0, 1];
+        for prefix in [
+            [3, 0, 0, 0], // VBV
+            [4, 0, 0, 0], // IBV
+            [6, 1, 0, 0], // root CBV
+            [7, 1, 0, 0], // root SRV
+            [8, 1, 0, 0], // root UAV
+            [5, 1, 0, 0], // empty constant
+            [5, 1, u32::MAX, 2],
+            [5, 1, 0, u32::MAX],
+            action,
+        ] {
+            assert!(map_indirect_args(&[prefix, action], 20, stages.into_iter()).is_none());
+        }
+        assert!(map_indirect_args(&[], 20, stages.into_iter()).is_none());
+        assert!(map_indirect_args(&[constant], 20, stages.into_iter()).is_none());
+        for stride in [16, 19, 21] {
+            assert!(map_indirect_args(&[constant, action], stride, stages.into_iter()).is_none());
+        }
+        assert!(map_indirect_args(&[constant, action], 20, stages.into_iter()).is_some());
+    }
+
+    #[test]
+    fn indirect_command_signature_accepts_root_constants() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping D3D12 command signature test: no host device");
+            return;
+        };
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_some()
+            && host.device.cast::<ID3D12InfoQueue>().is_err()
+        {
+            eprintln!("D3D12 debug info queue unavailable; testing runtime acceptance");
+        }
+        let parameters = [0, 1].map(|register| D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: register,
+                    Num32BitValues: 4,
+                    ..Default::default()
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+        let desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: parameters.len() as u32,
+            pParameters: parameters.as_ptr(),
+            ..Default::default()
+        };
+        let mut blob = None;
+        // SAFETY: the descriptor and parameter are valid for serialization.
+        let root: ID3D12RootSignature = unsafe {
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)
+                .unwrap();
+            let blob = blob.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            host.device.CreateRootSignature(0, bytes).unwrap()
+        };
+        let first = [user_data(1, 0, 0), user_data(1, 1, 3)];
+        let second = [user_data(2, 0, 0)];
+        let stages = [((0, 4), first.as_slice()), ((1, 4), second.as_slice())];
+        let dispatch = [DISPATCH, 0, 0, 0];
+        let single = [[5, 1, 0, 1], dispatch];
+        let split = [[5, 1, 0, 2], [5, 2, 0, 1], dispatch];
+        for (args, stride) in [(single.as_slice(), 16), (split.as_slice(), 24)] {
+            let layout = map_indirect_args(args, stride, stages.into_iter()).unwrap();
+            let signature =
+                host_signature_with_constants(&root, layout.kind, stride, &layout.constants);
+            let error = host.log_messages();
+            assert!(
+                signature.is_some(),
+                "root constants {:?}: {error:?}",
+                layout.constants
+            );
+            assert_eq!(error, None);
+        }
+    }
+
+    #[test]
+    fn placed_uav_texture_transitions_to_unordered_access_and_placed_srv_to_shader_resource() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let backing = Box::leak(Box::new([0x33u8; 256]));
+        let va = backing.as_ptr() as u64;
+        let resource = [3u32, 0, 0, 0, 4, 0, 4, 1 | (1 << 16), 28, 1, 0, 0, 4, 0];
+        let mut uav_desc = [0u32; 16];
+        uav_desc[0] = 28;
+        uav_desc[1] = 4; // D3D12_UAV_DIMENSION_TEXTURE2D
+        uav_desc[10] = va as u32;
+        uav_desc[11] = (va >> 32) as u32;
+        let mut srv_desc = [0u32; 16];
+        srv_desc[0] = 28;
+        srv_desc[1] = 4; // D3D12_SRV_DIMENSION_TEXTURE2D
+        srv_desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc[5] = 1; // MipLevels
+        srv_desc[10] = va as u32;
+        srv_desc[11] = (va >> 32) as u32;
+
+        let list = host.new_list().unwrap();
+        let uav_used = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let srv_used = UsedResource {
+            kind: ResourceType::Srv,
+            ..uav_used
+        };
+
+        readable(&list, &uav_used, &View::Placed(true, resource, uav_desc));
+        let tex = crate::resource::texture_at(va, &resource)
+            .expect("placed UAV texture should resolve to a host texture");
+        assert_eq!(
+            list.transition(tex, 0x800).map(|(_, before)| before),
+            Some(0x8),
+            "placed UAV should place the texture in UNORDERED_ACCESS"
+        );
+
+        readable(&list, &srv_used, &View::Placed(false, resource, srv_desc));
+        assert_eq!(
+            list.transition(tex, 0x800).map(|(_, before)| before),
+            Some(0xC0),
+            "placed SRV of a UAV texture should transition to SHADER_RESOURCE without CPU upload"
+        );
+        let host_tex = crate::resource::host_resource(tex).unwrap();
+        assert!(!crate::texture::title_written(host_tex));
+        list.close();
+    }
 }

@@ -177,6 +177,16 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
+/// The number of a committed version's folder: `v<N>` exactly as `commit`
+/// names it, without a sign or leading zeros. Any other name (`v01`, `v+1`)
+/// is not a version, so recovery neither counts nor removes it; read as a
+/// number, it would stand for the committed version and have it removed.
+fn version_number(file: &str) -> Option<u64> {
+    let digits = file.strip_prefix('v')?;
+    let number = digits.parse::<u64>().ok()?;
+    (number.to_string() == digits).then_some(number)
+}
+
 /// The container's newest committed version, if any. Removes what a crash
 /// left: unfinished versions and older ones.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
@@ -186,7 +196,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
+        } else if let Some(n) = version_number(&file) {
             committed.push(n);
         }
     }
@@ -402,7 +412,9 @@ fn remaining(root: &Path) -> u64 {
 /// new version is written before the old one goes, so nothing it replaces
 /// counts there).
 fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT> {
-    if written > QUOTA.saturating_sub(used) + replaced {
+    // Credit replaced blobs before clamping the remaining quota: clamping
+    // first would forgive any excess in a provider already over quota.
+    if written > QUOTA.saturating_sub(used.saturating_sub(replaced)) {
         Some(QUOTA_EXCEEDED)
     } else if written > free {
         Some(OUT_OF_LOCAL_STORAGE)
@@ -763,11 +775,14 @@ extern "system" fn read_blobs(
     size: usize,
     out: *mut u8,
 ) -> HRESULT {
+    if count.is_null() {
+        return E_INVALIDARG;
+    }
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
-    // SAFETY: the title passes its count.
-    let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
+    // SAFETY: the title supplies the required count, checked above for null.
+    let wanted = unsafe { count.read() };
     let blobs = match read(c, names(blob_names, wanted)) {
         Ok(blobs) => blobs,
         Err(hr) => return hr,
@@ -803,6 +818,9 @@ extern "system" fn read_result(
     out: *mut u8,
     count: *mut u32,
 ) -> HRESULT {
+    if count.is_null() {
+        return E_INVALIDARG;
+    }
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
     // The documented error for a small buffer; the result stays for a
@@ -980,6 +998,26 @@ mod tests {
         assert_eq!(no_room(mb, 0, 0, mb), None);
     }
 
+    #[test]
+    fn replacements_do_not_hide_an_existing_quota_excess() {
+        let mb = 1 << 20;
+        let used = QUOTA + mb;
+        let free = u64::MAX;
+        // Replacing bytes does not forgive the excess in the kept data.
+        assert_eq!(no_room(mb, mb, used, free), Some(QUOTA_EXCEEDED));
+        assert_eq!(no_room(1, mb, used, free), Some(QUOTA_EXCEEDED));
+        // Shrinking a replacement to exactly the quota is allowed.
+        assert_eq!(no_room(mb, 2 * mb, used, free), None);
+        assert_eq!(no_room(mb + 1, 2 * mb, used, free), Some(QUOTA_EXCEEDED));
+        // Deleting blobs must remain possible even before all excess is gone.
+        assert_eq!(no_room(0, mb / 2, used, free), None);
+        // The host still needs room for a replacement's new bytes.
+        assert_eq!(
+            no_room(mb, 2 * mb, used, mb - 1),
+            Some(OUT_OF_LOCAL_STORAGE)
+        );
+    }
+
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {
         Update {
             name: "Slot".into(),
@@ -1067,6 +1105,39 @@ mod tests {
             }
             assert!(seen.0 > 0 && seen.1 > 1, "{op}: {seen:?}");
         }
+    }
+
+    /// A folder whose name only reads as a committed version's number is
+    /// not one: recovery keeps the committed save and leaves the folder be.
+    #[test]
+    fn a_folder_named_like_a_version_does_not_remove_the_save() {
+        for good in ["v0", "v1", "v10", "v18446744073709551615"] {
+            assert!(version_number(good).is_some(), "{good}");
+        }
+        for bad in ["v01", "v001", "v+1", "v-1", "v 1", "v", "1", "V1", "v1.new", "v1x"] {
+            assert_eq!(version_number(bad), None, "{bad}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        assert!(slot.join("v1").is_dir());
+        let strays = ["v01", "v001", "v+1"];
+        for stray in strays {
+            std::fs::create_dir(slot.join(stray)).unwrap();
+        }
+        assert_eq!(state(root), old_state());
+        assert!(slot.join("v1").is_dir());
+        for stray in strays {
+            assert!(slot.join(stray).is_dir(), "{stray}");
+        }
+
+        // Updates still go on from the committed version.
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+        assert!(slot.join("v2").is_dir() && !slot.join("v1").exists());
+        let new = ("two".into(), vec![("a".into(), "new a".into()), ("b".into(), "old b".into())]);
+        assert_eq!(state(root), Some(new));
     }
 
     #[test]
@@ -1270,6 +1341,17 @@ mod tests {
         let mut buffer = vec![0u64; size.div_ceil(8)];
         let mut count = 0;
         assert_eq!(
+            read_result(
+                this,
+                &mut b,
+                size,
+                buffer.as_mut_ptr().cast(),
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+        assert!(buffer.iter().all(|&word| word == 0));
+        assert_eq!(
             read_result(this, &mut b, 8, buffer.as_mut_ptr().cast(), &mut count),
             BUFFER_TOO_SMALL
         );
@@ -1307,6 +1389,19 @@ mod tests {
                 *mut u8,
             ) -> HRESULT,
         >(&OBJECT, 0xa0);
+        buffer.fill(0);
+        assert_eq!(
+            read_now(
+                this,
+                container,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                size,
+                buffer.as_mut_ptr().cast()
+            ),
+            E_INVALIDARG
+        );
+        assert!(buffer.iter().all(|&word| word == 0));
         assert_eq!(
             read_now(
                 this,

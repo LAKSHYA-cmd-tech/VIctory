@@ -18,6 +18,11 @@ pub fn run(
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    if execute {
+        // Before the host's own memory (the image read below, the GPU
+        // device, the caches) takes the space the title's 32-bit memory needs.
+        victory_hle::modules::xmem::low_guards::install();
+    }
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
@@ -37,6 +42,15 @@ pub fn run(
         image.base(),
         image.info().image_base
     );
+    // The title's watchdog writes a breadcrumb through a null pointer (see
+    // `redirect_null_write`); point those writes at a page of ours first.
+    let redirected = victory_gpu::redirect_null_write(
+        image.base(),
+        image.info().size_of_image as usize,
+    );
+    if redirected > 0 {
+        println!("null write     {redirected} instruction(s) pointed at a low page");
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {
