@@ -6716,6 +6716,7 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        let direct_reads = self.read_phis.clone();
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
         // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
         // lowering accepts what it refuses when the same value is read directly.
@@ -6733,6 +6734,7 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            let is_direct = direct_reads.contains(&phi.value);
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -6743,8 +6745,17 @@ impl<'a> Lower<'a> {
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(why)), _)
+                        if is_direct || why.contains("scalar memory") || why.contains("s_memtime") =>
+                    {
                         return Err(Stop::Retry(phi.value, why));
+                    }
+                    (Some(Val::Missing(_)), _) => {
+                        if bit {
+                            self.s.m.bool(false)
+                        } else {
+                            self.s.m.i32(0)
+                        }
                     }
                     _ if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "a join of mismatched values"));
