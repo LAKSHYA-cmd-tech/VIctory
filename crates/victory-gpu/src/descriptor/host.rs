@@ -363,17 +363,17 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
-            let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
+            let kept = make(&view, self.cpu(index));
+            if let Some(kept) = kept {
+                made[index as usize] = key;
+                self.keep(index, kept);
             } else {
-                make(&view, self.cpu(index))
-            };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+                made[index as usize] = 0;
+                if !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, None);
             }
-            self.keep(index, kept.flatten());
         }
         Some(view)
     }
@@ -972,5 +972,29 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// Buffer views mirror on creation when their host copy exists, so
+    /// shaders indexing the heap directly at run time read the real view
+    /// rather than a null descriptor.
+    /// A buffer view without a host shadow falls back to null, keeping its
+    /// key at 0 so it can be retried once the memory is registered.
+    #[test]
+    fn buffer_views_mirror_on_creation() {
+        if host().is_none() {
+            return;
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let mut title_slot = [0u64; 4];
+        let s0 = title_slot.as_mut_ptr() as u64;
+        super::super::create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), s0);
+        // SAFETY: s0 is our stack-allocated array.
+        let [tag, _i, _generation] = unsafe { *(s0 as *const [u32; 3]) };
+        assert_eq!(tag, VIEW_TAG);
+        heap.mirror(0, s0, false);
+        // Resource is null, so make() returns None and made[0] stays 0 for later retry.
+        assert_eq!(heap.made.lock().unwrap()[0], 0);
     }
 }

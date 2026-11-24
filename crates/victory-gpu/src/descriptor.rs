@@ -300,6 +300,7 @@ impl View {
     /// of resources or of memory) or memory the title placed a texture in:
     /// such views get host slots only for draws.
     #[cfg(windows)]
+    #[allow(dead_code)]
     fn is_buffer(&self) -> bool {
         match self {
             View::Constant(..) | View::Placed(..) => true,
