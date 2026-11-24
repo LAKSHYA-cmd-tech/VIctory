@@ -3146,7 +3146,6 @@ impl<'a> Lower<'a> {
         let Source::Loaded { first, .. } = src else {
             unreachable!()
         };
-        };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
