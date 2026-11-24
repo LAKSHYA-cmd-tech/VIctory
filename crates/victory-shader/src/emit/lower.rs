@@ -6229,11 +6229,16 @@ impl<'a> Lower<'a> {
             let (h, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                    if stride >= 4 && stride.is_multiple_of(4) {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        (h, [index, off, iu])
+                    } else {
+                        let s = self.s.m.i32(if stride > 0 { stride } else { 4 });
+                        let idx_bytes = self.s.m.bin(c, Bin::Mul, index, s);
+                        let total_off = self.s.m.bin(c, Bin::Add, idx_bytes, off);
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        (h, [total_off, iu, iu])
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
@@ -6312,11 +6317,19 @@ impl<'a> Lower<'a> {
                 match index {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
+                        if stride >= 4 && stride.is_multiple_of(4) {
+                            args.push(self.handle(site, src, false, (12 | u, stride))?);
+                            args.extend([index, off]);
+                        } else {
+                            let s =
+                                self.s
+                                    .m
+                                    .i32(if stride > 0 { stride } else { 4 * count as u32 });
+                            let idx_bytes = self.s.m.bin(c, Bin::Mul, index, s);
+                            let total_off = self.s.m.bin(c, Bin::Add, idx_bytes, off);
+                            args.push(self.handle(site, src, false, (11 | u, 0))?);
+                            args.extend([total_off, iu]);
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -6373,18 +6386,33 @@ impl<'a> Lower<'a> {
             match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                    if stride >= 4 && stride.is_multiple_of(4) {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, index, off, mask, align],
+                        )
+                    } else {
+                        let s = self
+                            .s
+                            .m
+                            .i32(if stride > 0 { stride } else { 4 * count as u32 });
+                        let idx_bytes = self.s.m.bin(c, Bin::Mul, index, s);
+                        let total_off = self.s.m.bin(c, Bin::Add, idx_bytes, off);
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, total_off, iu, mask, align],
+                        )
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
@@ -7220,6 +7248,5 @@ mod tests {
             S_ENDPGM,
         ];
         lowers(&words).unwrap();
-    }
     }
 }
