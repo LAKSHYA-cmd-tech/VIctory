@@ -954,7 +954,7 @@ impl<'a> Lower<'a> {
                         Fields::Valu(v) => match v.src.get(2) {
                             Some(&Operand::Scalar { code, .. }) => i
                                 .read(Reg::S(code))
-                                .is_none_or(|m| !x.st.masks.contains_key(&m)),
+                                .is_none_or(|m| !x.st.masks.contains_key(&m) && !x.st.other.contains_key(&m)),
                             _ => false,
                         },
                         _ => false,
@@ -2960,11 +2960,37 @@ impl<'a> Lower<'a> {
         match op {
             Some(&Operand::Const(128)) | Some(&Operand::Literal(0)) => Ok(self.s.m.bool(false)),
             Some(&Operand::Const(193)) => Ok(self.s.m.bool(true)),
+            Some(&Operand::Const(k)) => {
+                let x = crate::resource::inline(k).ok_or(err)?;
+                if x == 0 {
+                    Ok(self.s.m.bool(false))
+                } else if x == u32::MAX {
+                    Ok(self.s.m.bool(true))
+                } else if self.console_lanes {
+                    let lo = self.s.m.i32(x);
+                    let hi = if (x as i32) < 0 {
+                        Some(self.s.m.i32(u32::MAX))
+                    } else {
+                        Some(self.s.m.i32(0))
+                    };
+                    self.s.flags |= flags::WAVE_OPS;
+                    Ok(self.lane_bit(at, lo, hi))
+                } else {
+                    Err("a constant lane mask")
+                }
+            }
             Some(&Operand::Scalar { code, .. }) if code == NULL => Ok(self.s.m.bool(false)),
             Some(&Operand::Scalar { code, .. }) => {
                 if let Some(m) = inst
                     .read(Reg::S(code))
-                    .and_then(|v| self.x.st.masks.get(&v).copied())
+                    .and_then(|v| {
+                        self.x
+                            .st
+                            .masks
+                            .get(&v)
+                            .or_else(|| self.x.st.other.get(&v))
+                            .copied()
+                    })
                 {
                     return self.boolean(m, at);
                 }
@@ -6291,7 +6317,7 @@ impl<'a> Lower<'a> {
         ];
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
-            && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16")
+            && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16" | "v_ldexp_f16")
         {
             return None;
         }
@@ -6332,6 +6358,49 @@ impl<'a> Lower<'a> {
         if name == "v_cvt_f16_f32" {
             let f = self.fsrc(inst, 0)?;
             return float_result(self, f);
+        }
+        if name == "v_ldexp_f16" {
+            // D.f16 = S0.f16 * 2^(S1.i16). S1 is a signed 16-bit integer exponent,
+            // so float abs/neg modifiers apply only to S0.
+            if (v.abs | v.neg) & 2 != 0 {
+                return Err("float modifier on v_ldexp_f16 exponent");
+            }
+            let a = self.half_fsrc(inst, 0)?;
+            let raw_e = self.half_src(inst, 1)?;
+            let k16 = self.s.m.i32(16);
+            let e = self.s.m.bin(c, Bin::Shl, raw_e, k16);
+            let e = self.s.m.bin(c, Bin::AShr, e, k16);
+            // Clamp exponent to [-64, 64] so 2^e is always a normal finite f32:
+            // - +-0 * finite = +-0 (never 0 * inf = NaN),
+            // - +-inf * finite = +-inf (never inf * 0 = NaN),
+            // - min f16 (2^-24) * 2^64 overflows f16 to +-inf,
+            // - max f16 (~2^16) * 2^-64 underflows f16 to +-0.
+            let lo = self.s.m.i32((-64i32) as u32);
+            let hi = self.s.m.i32(64);
+            let under = self.s.m.cmp(c, pred::SLT, e, lo);
+            let e = self.s.m.select(c, under, lo, e);
+            let over = self.s.m.cmp(c, pred::SGT, e, hi);
+            let e = self.s.m.select(c, over, hi, e);
+            let bias = self.s.m.i32(127);
+            let k23 = self.s.m.i32(23);
+            let biased = self.s.m.bin(c, Bin::Add, e, bias);
+            let scale_bits = self.s.m.bin(c, Bin::Shl, biased, k23);
+            let scale = self.as_float(scale_bits);
+            let r = self.s.m.bin(c, Bin::Mul, a, scale);
+            // DXIL `legacyF32ToF16` rounds toward zero on NVIDIA/WARP and clamps finite
+            // values >= 65536 to 0x7BFF (max finite f16). Under RDNA2's default RTE mode,
+            // |r| >= 65520.0 (the f16 overflow threshold) overflows to signed infinity.
+            let abs_r = self.unary(6, r);
+            let ov_thresh = self.s.m.f32(65520.0f32.to_bits());
+            let overflows = self.s.m.cmp(c, pred::OGE, abs_r, ov_thresh);
+            let r_bits = self.as_int(r);
+            let sign_mask = self.s.m.i32(0x8000_0000);
+            let inf_bits = self.s.m.i32(0x7F80_0000);
+            let r_sign = self.s.m.bin(c, Bin::And, r_bits, sign_mask);
+            let signed_inf_bits = self.s.m.bin(c, Bin::Or, r_sign, inf_bits);
+            let signed_inf = self.as_float(signed_inf_bits);
+            let r = self.s.m.select(c, overflows, signed_inf, r);
+            return float_result(self, r);
         }
         if float2.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
@@ -9412,6 +9481,24 @@ mod tests {
             options: super::TranslateOptions::default(),
         })
         .map(|_| ())
+    }
+
+    #[test]
+    fn v_cndmask_accepts_uniform_and_constant_masks() {
+        // Uniform select (`s_cselect_b32`) and inline constant masks in `v_cndmask_b32`
+        // (resolved in `Structured::other` or directly as constants).
+        let words = [
+            0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
+            0x8500_80C1,    // s_cselect_b32 s0, -1, 0
+            0xD501_0001,
+            0x0001_0080,    // v_cndmask_b32 v1, 0, 1, s0
+            0xD501_0002,
+            0x0201_02C1,    // v_cndmask_b32 v2, 1, v1, -1
+            0xD834_0000,
+            0x0000_0200,    // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        lowers(&words, 0x8001).unwrap();
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
