@@ -43,6 +43,8 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// What keeps the mapping alive when `buffer` is a sparse one.
+    pub(crate) _backing: Option<ID3D12Resource>,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -124,6 +126,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            _backing: None,
         }
     }
 
@@ -460,6 +463,14 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_or(address, len, loose)
+}
+
+fn find_or(
+    address: u64,
+    len: u64,
+    loose: impl FnOnce(u64, u64) -> Option<Arc<Shadow>>,
+) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     // The innermost buffer holding the range: the largest start at or below
@@ -586,19 +597,135 @@ pub(crate) fn aligned_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.checked_next_multiple_of(WINDOW)?.checked_sub(start)?;
+    loose_window(address, end, start, len)
+}
+
+/// Wide windows of title memory by start: the copy and where its window
+/// ends (the copy itself holds only committed memory from where root SRVs
+/// in the window point on).
+static WIDE: Mutex<BTreeMap<u64, (Arc<Shadow>, u64)>> = Mutex::new(BTreeMap::new());
+
+/// When a wide window last looked for title memory committed past its copy.
+static WIDE_CHECKED: Mutex<BTreeMap<u64, std::time::Instant>> = Mutex::new(BTreeMap::new());
+
+/// Like [`find`], for a range a root SRV may read: a title buffer holding
+/// it, else a window of title memory twice the range's size rounded up to a
+/// power of two, on a grid of that size, so any range fits one and each
+/// title byte is in at most two. The window is a sparse buffer: the title's
+/// committed memory from the lowest root SRV in it on is copied, the rest
+/// are unmapped tiles that read as zeros. The world's mesh shaders read
+/// there, past the committed end of streaming pools (Aftermath: 741 KB past
+/// it), which the console answers with zeros too; backing whole windows
+/// cost 11.5 GB.
+pub(crate) fn find_wide(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_or(address, len, |address, end| {
+        const TILE: u64 = 64 << 10;
+        let mut wide = WIDE.lock().unwrap_or_else(|e| e.into_inner());
+        let grain = (end - address).next_power_of_two().max(WINDOW);
+        let start = address & !(grain - 1);
+        let limit = start + 2 * grain;
+        // A window of a lower cell may hold the range already.
+        if let Some(shadow) = wide
+            .range(..start)
+            .rev()
+            .take(2)
+            .find(|(_, (s, window_end))| s.start <= address && *window_end >= end)
+            .map(|(_, (s, _))| s.clone())
+        {
+            return Some(shadow);
+        }
+        let mut lo = address & !(TILE - 1);
+        let mut hi = 0;
+        if let Some((shadow, _)) = wide.get(&start) {
+            let has = shadow.start + shadow.len;
+            if shadow.start <= address {
+                if has >= end {
+                    return Some(shadow.clone());
+                }
+                // The title commits more of a pool as it streams: look
+                // again now and then whether the copy stops short of it.
+                let mut checked = WIDE_CHECKED.lock().unwrap_or_else(|e| e.into_inner());
+                let now = std::time::Instant::now();
+                if checked
+                    .get(&start)
+                    .is_some_and(|t| now - *t < std::time::Duration::from_millis(100))
+                {
+                    return Some(shadow.clone());
+                }
+                checked.insert(start, now);
+                if committed_end(address, limit) <= has {
+                    return Some(shadow.clone());
+                }
+            }
+            lo = lo.min(shadow.start);
+            hi = has;
+        }
+        let committed = committed_end(address, limit).max(hi);
+        let backed = (committed - lo).next_multiple_of(TILE).min(limit - lo);
+        let (buffer, backing, data) = host()?.sparse_buffer(2 * grain, lo - start, backed)?;
+        crate::host::name(&buffer, || format!("title memory {lo:#x}+{backed:#x} (sparse)"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (lo - start);
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            len = backed,
+            full = 2 * grain,
+            "wide loose memory copied to the host"
+        );
+        let mut shadow = Shadow::new(buffer, data, gpu, lo, backed);
+        shadow._backing = Some(backing);
+        let shadow = Arc::new(shadow);
+        wide.insert(start, (shadow.clone(), limit));
+        Some(shadow)
+    })
+}
+
+/// Where title memory committed from `address` on ends, at most `limit`
+/// (adjacent allocations count: the title sees one address space).
+fn committed_end(address: u64, limit: u64) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut p = address;
+    while p < limit {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != MEM_COMMIT {
+            break;
+        }
+        p = info.BaseAddress as u64 + info.RegionSize as u64;
+    }
+    p.min(limit).max(address + 1)
+}
+
+fn loose_window(address: u64, end: u64, start: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
-        return Some(shadow.clone());
+    // Any window copied already that holds the range: a range crossing a
+    // window's end used to get a second copy of the same bytes.
+    if let Some(shadow) = map
+        .range((start, 0)..=(start, u64::MAX))
+        .find(|(_, s)| s.start <= address && s.start + s.len >= end)
+        .map(|(_, s)| s.clone())
+    {
+        return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
+    if len >= 32 << 20 {
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            len,
+            "wide loose memory copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory copied to the host"
+        );
+    }
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
     map.insert((start, len), shadow.clone());
     Some(shadow)
