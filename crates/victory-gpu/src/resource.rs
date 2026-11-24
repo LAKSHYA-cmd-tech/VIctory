@@ -1266,7 +1266,7 @@ pub(crate) extern "system" fn create_at_address(
 /// description viewed); release them when the title unmaps or reuses the
 /// memory once streaming grows VRAM use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+pub(crate) static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The resource for a texture placed at `address` with the resource

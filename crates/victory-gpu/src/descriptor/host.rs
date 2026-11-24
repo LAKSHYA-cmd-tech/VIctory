@@ -1340,7 +1340,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
@@ -1348,7 +1348,11 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    if *unordered {
+        Some(View::Unordered(texture as usize, 0, desc[..10].try_into().ok()))
+    } else {
+        Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -1803,5 +1807,46 @@ mod tests {
         let mut dummy_handle: [u32; 3] = [0, 0, 0];
         let handle_ptr = (&raw mut dummy_handle) as u64;
         assert!(heap.mirror(1_245_000, handle_ptr, false).is_none());
+    }
+
+    /// Placed texture views produce real UAVs and SRVs instead of dropping to null.
+    #[test]
+    fn placed_texture_views_produce_uav_and_srv() {
+        let dummy_tex = 0x1234_5678 as usize;
+        let address = 0x8000_1000_u64;
+        let mut resource = [0u32; 14];
+        resource[0] = 2; // Texture2D, not BUFFER (1)
+        let mut desc = [0u32; 16];
+        desc[0] = 28; // DXGI_FORMAT_R8G8B8A8_UNORM
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+
+        // Populate PLACED_TEXTURES map with our dummy resource
+        crate::resource::PLACED_TEXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((address, resource), dummy_tex);
+
+        // SRV: View::Placed(false, ...) -> View::Shader
+        let srv_view = View::Placed(false, resource, desc);
+        let srv_res = placed_texture(&srv_view);
+        assert_eq!(
+            srv_res,
+            Some(View::Shader(dummy_tex, desc[..10].try_into().ok()))
+        );
+
+        // UAV: View::Placed(true, ...) -> View::Unordered
+        let uav_view = View::Placed(true, resource, desc);
+        let uav_res = placed_texture(&uav_view);
+        assert_eq!(
+            uav_res,
+            Some(View::Unordered(dummy_tex, 0, desc[..10].try_into().ok()))
+        );
+
+        // Buffer: resource[0] == 1 -> None
+        let mut buf_resource = resource;
+        buf_resource[0] = 1;
+        let buf_view = View::Placed(true, buf_resource, desc);
+        assert_eq!(placed_texture(&buf_view), None);
     }
 }
