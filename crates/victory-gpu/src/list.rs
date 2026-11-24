@@ -133,6 +133,33 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// The dynamic descriptor slots of a title list, if there is a host GPU.
+#[cfg(windows)]
+fn lease(this: This) -> Option<std::sync::Arc<crate::descriptor::lease::Lease>> {
+    host_list(this)?;
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+    Some(state.lease().clone())
+}
+
+/// Before a list is submitted: false if the slots of its tables were taken
+/// back after an earlier submission (a heap ran short, see
+/// [`crate::descriptor::lease`]); it must not run again until it is reset.
+/// Until [`finished`] its slots cannot be taken back.
+#[cfg(windows)]
+pub(crate) fn may_run(this: This) -> bool {
+    lease(this).is_none_or(|lease| lease.start())
+}
+
+/// After a list ran: its slots may be taken back if a heap runs short.
+#[cfg(windows)]
+pub(crate) fn finished(this: This) {
+    if let Some(lease) = lease(this) {
+        lease.finish();
+    }
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
@@ -754,8 +781,13 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                depth,
+                stencil,
+                rects,
+            )
         };
     }
     #[cfg(not(windows))]
@@ -887,7 +919,10 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Some(len) = usize::try_from(size)
+        .ok()
+        .and_then(|s| s.checked_add(align))
+    else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
@@ -900,7 +935,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
@@ -1069,8 +1107,7 @@ mod state {
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// When `indirect != 0`, executes indirect mesh dispatches.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1080,8 +1117,11 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            const MESH_ARGS: [[u32; 4]; 1] = [[10, 0, 0, 0]];
+            const STRIDE: u32 = 12;
+            with_state(this, |list, s| {
+                s.execute_indirect(list, (&MESH_ARGS, STRIDE, x.max(1)), indirect, None);
+            });
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1140,15 +1180,8 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
-/// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
-/// hold one argument each: draw (stride 16), indexed draw (20), dispatch
-/// (12), mesh dispatch (12), and the console's single-pass dispatch, type
-/// 105 (stride 12: the three group counts; its flags live in the
-/// signature, the title passes none), run as a plain dispatch. They run
-/// through the host's indirect execution (`State::execute_indirect`).
-/// shortcut: signatures that change root arguments are dropped (logged
-/// once per signature).
+/// Runs an indirect draw or dispatch with optional root constants.
+/// Unsupported signatures are dropped and logged once per signature.
 extern "system" fn execute_indirect(
     this: This,
     signature: This,
@@ -1166,14 +1199,11 @@ extern "system" fn execute_indirect(
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if let Some(address) = address
         && (count.is_null() || counter.is_some())
     {
-        const DISPATCH: u32 = 2;
-        const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (args, stride, max), address, counter);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -1241,7 +1271,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1438,10 +1469,36 @@ mod tests {
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        assert!(
+            allocate_upload(list, 8, 0x30).is_null(),
+            "not a power of two"
+        );
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
-        assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let uploads = unsafe { &(*list.cast::<List>()).uploads };
+        assert!(uploads.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn dispatch_mesh_x_routes_direct_and_indirect_dispatches() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+
+        // Direct mesh dispatch:
+        state::dispatch_mesh_x(list, 4, 0, 0, 0);
+        // Indirect mesh dispatch:
+        state::dispatch_mesh_x(list, 1, 0, 0x10000, 0);
+
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
