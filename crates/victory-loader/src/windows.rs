@@ -1,19 +1,19 @@
 //! Loading a prepared image as a real Windows module and binding it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CString, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
-use windows_sys::Win32::System::Memory::{
-    MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualProtect, VirtualQuery,
-};
+#[cfg(test)]
+use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
@@ -206,13 +206,26 @@ impl ImportResolver for WithTitleDlls<'_> {
     }
 }
 
+static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Writes `bytes` to content-addressed `path` if not already cached on disk.
+/// Because `path` includes the BLAKE3 digest of `bytes`, a metadata length
+/// match is a 0-byte-read cache hit; misses stage into a unique per-writer
+/// file before renaming atomically.
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+    if std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == bytes.len() as u64) {
         return Ok(());
     }
-    let tmp = path.with_extension("tmp");
+    let id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{id}", std::process::id()));
     std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        if std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == bytes.len() as u64) {
+            return Ok(());
+        }
+        return Err(err).with_context(|| format!("renaming to {}", path.display()));
+    }
     Ok(())
 }
 
@@ -221,6 +234,7 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
 ///
 /// # Safety
 /// `slot` must point to eight writable bytes that no other thread accesses.
+#[cfg(test)]
 unsafe fn write_iat_slot(slot: *mut u8, address: u64) {
     // SAFETY: guaranteed by the caller; no alignment is required.
     unsafe { slot.cast::<u64>().write_unaligned(address) };
@@ -228,8 +242,10 @@ unsafe fn write_iat_slot(slot: *mut u8, address: u64) {
 
 /// Every protection region touched while making an IAT slot writable.
 /// Restore earlier changes too if setting up a later region fails.
+#[cfg(test)]
 struct IatProtections(Vec<(*const c_void, usize, u32)>);
 
+#[cfg(test)]
 impl IatProtections {
     fn restore(&mut self) -> Result<()> {
         let mut error = None;
@@ -248,6 +264,7 @@ impl IatProtections {
     }
 }
 
+#[cfg(test)]
 impl Drop for IatProtections {
     fn drop(&mut self) {
         let _ = self.restore();
@@ -258,6 +275,7 @@ impl Drop for IatProtections {
 /// The eight-byte range at `slot` must be in reserved memory owned by the
 /// caller. No other thread may access it or change its protections while
 /// it is being bound. Uncommitted pages are reported as an error.
+#[cfg(test)]
 unsafe fn write_protected_iat_slot(slot: *mut u8, address: u64) -> Result<()> {
     let end = (slot as usize)
         .checked_add(8)
@@ -381,17 +399,13 @@ impl LoadedImage {
         Ok(report)
     }
 
-    /// Protects and restores each slot on its own: import tables can sit in
-    /// sections with different protections (delay-load tables in `.didat`).
+    /// Protects and restores IAT slots batched by 4 KiB page: import tables can
+    /// sit in sections with different protections (delay-load tables in `.didat`),
+    /// so batching per page preserves per-section protection while cutting
+    /// `VirtualProtect` syscalls from 2×slots down to 2×pages.
     fn write_slots(&self, slots: &[(u32, usize)]) -> Result<()> {
-        for &(rva, address) in slots {
-            let slot = (self.base() + rva as usize) as *mut u8;
-            // SAFETY: the parser bounds every slot, and the image is bound
-            // before title code can access its imports.
-            unsafe { write_protected_iat_slot(slot, address as u64) }
-                .with_context(|| format!("binding IAT slot {rva:#x}"))?;
-        }
-        Ok(())
+        // SAFETY: the parser only yields slots inside the mapped image.
+        unsafe { write_slots_at(self.base(), slots) }.map(|_| ())
     }
 
     /// Calls the image's TLS callbacks with `reason` (e.g. `DLL_PROCESS_ATTACH`).
@@ -517,6 +531,72 @@ impl LoadedImage {
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
     }
+}
+
+/// Writes `(rva, address)` IAT slots relative to `base`, batching
+/// `VirtualProtect` calls by 4 KiB page. Returns the number of page-protection
+/// round-trips performed.
+///
+/// # Safety
+/// Every `base + rva` must point to 8 valid mapped bytes belonging to the image.
+unsafe fn write_slots_at(base: usize, slots: &[(u32, usize)]) -> Result<usize> {
+    const PAGE: usize = 0x1000;
+    let mut by_page: BTreeMap<usize, Vec<(u32, usize, u64)>> = BTreeMap::new();
+    let mut straddling: Vec<(u32, usize, u64)> = Vec::new();
+    for &(rva, address) in slots {
+        let addr = base + rva as usize;
+        if (addr & (PAGE - 1)) + size_of::<u64>() <= PAGE {
+            by_page
+                .entry(addr & !(PAGE - 1))
+                .or_default()
+                .push((rva, addr, address as u64));
+        } else {
+            straddling.push((rva, addr, address as u64));
+        }
+    }
+    let mut protect_calls = 0usize;
+    for (page, group) in by_page {
+        let mut old = 0u32;
+        // SAFETY: every slot in `group` lies inside `page..page+PAGE`.
+        if unsafe { VirtualProtect(page as *const c_void, PAGE, PAGE_READWRITE, &mut old) } == 0 {
+            let rva = group[0].0;
+            bail!(
+                "VirtualProtect(IAT page for slot {rva:#x}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        for &(_, addr, value) in &group {
+            // SAFETY: inside the mapped page, now writable.
+            unsafe {
+                if addr.is_multiple_of(align_of::<u64>()) {
+                    (addr as *mut u64).write_volatile(value);
+                } else {
+                    (addr as *mut u64).write_unaligned(value);
+                }
+            }
+        }
+        let mut ignored = 0u32;
+        // SAFETY: restoring the protection we just changed.
+        unsafe { VirtualProtect(page as *const c_void, PAGE, old, &mut ignored) };
+        protect_calls += 1;
+    }
+    for (rva, addr, value) in straddling {
+        let mut old = 0u32;
+        // SAFETY: caller guarantees 8 mapped bytes at `addr`.
+        if unsafe { VirtualProtect(addr as *const c_void, 8, PAGE_READWRITE, &mut old) } == 0 {
+            bail!(
+                "VirtualProtect(IAT slot {rva:#x}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // SAFETY: inside the image, now writable.
+        unsafe { (addr as *mut u64).write_unaligned(value) };
+        let mut ignored = 0u32;
+        // SAFETY: restoring the protection we just changed.
+        unsafe { VirtualProtect(addr as *const c_void, 8, old, &mut ignored) };
+        protect_calls += 1;
+    }
+    Ok(protect_calls)
 }
 
 #[cfg(test)]
@@ -653,5 +733,86 @@ mod tests {
             assert_eq!(bytes.0[start..start + 8], address.to_le_bytes());
             assert!(bytes.0[start + 8..].iter().all(|&b| b == 0xA5));
         }
+    }
+
+    #[test]
+    fn write_slots_batches_virtual_protect_by_page_and_restores_protection() {
+        // SAFETY: allocates 3 private 4 KiB read-only pages and frees them before returning.
+        unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null(),
+                3 * 0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READONLY,
+            ) as usize;
+            assert_ne!(base, 0);
+            let mut slots = Vec::new();
+            for page in 0u32..3 {
+                for i in 0u32..32 {
+                    let rva = page * 0x1000 + i * 8;
+                    let val = 0x1000_0000usize + ((page as usize) << 12) + i as usize;
+                    slots.push((rva, val));
+                }
+            }
+            let round_trips = write_slots_at(base, &slots).unwrap();
+            assert_eq!(
+                round_trips, 3,
+                "96 slots across 3 pages should take 3 protect calls"
+            );
+            for &(rva, val) in &slots {
+                assert_eq!(((base + rva as usize) as *const u64).read(), val as u64);
+            }
+            for page in 0usize..3 {
+                let mut mbi = MEMORY_BASIC_INFORMATION {
+                    BaseAddress: std::ptr::null_mut(),
+                    AllocationBase: std::ptr::null_mut(),
+                    AllocationProtect: 0,
+                    PartitionId: 0,
+                    RegionSize: 0,
+                    State: 0,
+                    Protect: 0,
+                    Type: 0,
+                };
+                assert_ne!(
+                    VirtualQuery(
+                        (base + page * 0x1000) as *const c_void,
+                        &mut mbi,
+                        size_of::<MEMORY_BASIC_INFORMATION>()
+                    ),
+                    0
+                );
+                assert_eq!(mbi.Protect & 0xff, PAGE_READONLY);
+            }
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn content_hashed_cache_hits_without_overwriting_and_varies_with_prepared_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes_a = b"prepared-image-v1".to_vec();
+        let bytes_b = b"prepared-image-v2".to_vec();
+        let orig = blake3::hash(b"original-image");
+        let name_a = format!(
+            "victory-image-{}-{}.dll",
+            &orig.to_hex()[..16],
+            &blake3::hash(&bytes_a).to_hex()[..16]
+        );
+        let name_b = format!(
+            "victory-image-{}-{}.dll",
+            &orig.to_hex()[..16],
+            &blake3::hash(&bytes_b).to_hex()[..16]
+        );
+        assert_ne!(name_a, name_b);
+
+        let path_a = dir.path().join(&name_a);
+        write_if_changed(&path_a, &bytes_a).unwrap();
+        assert_eq!(std::fs::read(&path_a).unwrap(), bytes_a);
+        // Second call with same content-addressed path and length is a stat-only hit.
+        write_if_changed(&path_a, &bytes_a).unwrap();
+        assert_eq!(std::fs::read(&path_a).unwrap(), bytes_a);
+        // No stale `.tmp.*` files left behind.
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1);
     }
 }

@@ -244,6 +244,18 @@ pub(crate) fn execute(
     };
 }
 
+pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
+    // SAFETY: transitions the indirect argument buffer back to UNORDERED_ACCESS.
+    unsafe {
+        list.list.ResourceBarrier(&[crate::host::transition(
+            buffer,
+            windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )])
+    };
+    list.set_unordered(buffer);
+}
+
 pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,

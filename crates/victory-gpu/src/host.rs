@@ -927,6 +927,9 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Host buffers currently in explicit `D3D12_RESOURCE_STATE_UNORDERED_ACCESS`
+    /// on this list.
+    unordered: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1809,24 +1812,105 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
-    /// The latest producer of this range if it wrote a covering host
-    /// copy on the GPU. Deferred CPU writes keep their upload snapshots.
+    /// Marks the current end of deferred steps before preparing a draw or
+    /// dispatch whose `Step::GpuWrite` entries only take effect once recorded.
+    pub(crate) fn mark_gpu_writes(&self) -> usize {
+        self.deferred().copies.len()
+    }
+
+    /// Commits `Step::GpuWrite` entries added since `mark`, recording that
+    /// their host buffers are now in `D3D12_RESOURCE_STATE_UNORDERED_ACCESS`.
+    pub(crate) fn commit_gpu_writes(&self, mark: usize) {
+        let mut deferred = self.deferred();
+        let Deferred {
+            copies, unordered, ..
+        } = &mut *deferred;
+        for step in &copies[mark..] {
+            if let Step::GpuWrite(shadow, ..) = step {
+                unordered.insert(shadow.buffer.as_raw() as usize);
+            }
+        }
+    }
+
+    /// Drops `Step::GpuWrite` entries added since `mark` when a draw or
+    /// dispatch is dropped without recording on the host command list.
+    pub(crate) fn discard_gpu_writes(&self, mark: usize) {
+        let mut deferred = self.deferred();
+        let tail = deferred.copies.split_off(mark);
+        deferred.copies.extend(
+            tail.into_iter()
+                .filter(|step| !matches!(step, Step::GpuWrite(..))),
+        );
+    }
+
+    /// Records that `buffer` is in `D3D12_RESOURCE_STATE_UNORDERED_ACCESS` on
+    /// this command list.
+    pub(crate) fn set_unordered(&self, buffer: &ID3D12Resource) {
+        self.deferred().unordered.insert(buffer.as_raw() as usize);
+    }
+
+    /// Whether `buffer` is currently in `D3D12_RESOURCE_STATE_UNORDERED_ACCESS`
+    /// on this command list.
+    pub(crate) fn is_unordered(&self, buffer: &ID3D12Resource) -> bool {
+        self.deferred()
+            .unordered
+            .contains(&(buffer.as_raw() as usize))
+    }
+
+    /// The host copy when every byte in `ranges` has its latest contents
+    /// written on the GPU into the same [`crate::shadow::Shadow`], with no
+    /// intervening CPU write. Deferred CPU writes keep their upload snapshots.
     pub(crate) fn written_shadow(
         &self,
-        address: usize,
-        len: usize,
+        ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        let end = address.checked_add(len)?;
-        let overlaps = |at: usize, size: usize| size != 0 && at < end && address < at + size;
-        for step in self.deferred().copies.iter().rev() {
+        let mut uncovered: Vec<(usize, usize)> = ranges
+            .into_iter()
+            .filter(|r| r.start < r.end)
+            .map(|r| (r.start, r.end))
+            .collect();
+        if uncovered.is_empty() {
+            return None;
+        }
+        let deferred = self.deferred();
+        let mut chosen: Option<&std::sync::Arc<crate::shadow::Shadow>> = None;
+        for step in deferred.copies.iter().rev() {
             match step {
-                Step::GpuWrite(shadow, at, size) if overlaps(*at, *size) => {
-                    // A partial producer still needs the copy's CPU snapshot
-                    // for bytes that subsequent refreshes can overwrite.
-                    return (*at <= address && end <= at + size).then(|| shadow.clone());
+                Step::GpuWrite(shadow, at, size, ..) if *size > 0 => {
+                    let (w0, w1) = (*at, at.saturating_add(*size));
+                    if !uncovered.iter().any(|&(a, b)| w0 < b && a < w1) {
+                        continue;
+                    }
+                    match chosen {
+                        Some(prev) if !std::sync::Arc::ptr_eq(prev, shadow) => return None,
+                        None => chosen = Some(shadow),
+                        Some(_) => {}
+                    }
+                    let mut next = Vec::with_capacity(uncovered.len() + 1);
+                    for (a, b) in uncovered {
+                        if w1 <= a || b <= w0 {
+                            next.push((a, b));
+                        } else {
+                            if a < w0 {
+                                next.push((a, w0));
+                            }
+                            if w1 < b {
+                                next.push((w1, b));
+                            }
+                        }
+                    }
+                    uncovered = next;
+                    if uncovered.is_empty() {
+                        return Some(shadow.clone());
+                    }
                 }
-                Step::Copy(dst, _, size) if overlaps(*dst, *size) => return None,
-                // Raw deferred CPU work can write this range too.
+                Step::Copy(dst, _, size) if *size > 0 => {
+                    let (c0, c1) = (*dst, dst.saturating_add(*size));
+                    if uncovered.iter().any(|&(a, b)| c0 < b && a < c1) {
+                        return None;
+                    }
+                }
+                // Arbitrary deferred CPU work may touch uncovered bytes.
                 Step::Run(_) => return None,
                 _ => {}
             }
