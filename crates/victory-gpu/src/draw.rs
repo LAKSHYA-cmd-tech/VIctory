@@ -777,12 +777,15 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        let mark = list.mark_gpu_writes();
         if !self.bind(list, p, true) {
+            list.discard_gpu_writes(mark);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        list.commit_gpu_writes(mark);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -842,6 +845,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        let mark = list.mark_gpu_writes();
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -854,7 +858,10 @@ impl State {
                 }
                 Err(_) => false,
             };
-        if !ran {
+        if ran {
+            list.commit_gpu_writes(mark);
+        } else {
+            list.discard_gpu_writes(mark);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
@@ -1097,8 +1104,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
+        let mark = list.mark_gpu_writes();
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
+            list.commit_gpu_writes(mark);
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
                 (vertices / 3 * 6, 0)
@@ -1115,6 +1124,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
+            list.discard_gpu_writes(mark);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
@@ -1190,8 +1200,10 @@ impl State {
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
         }
+        let mark = list.mark_gpu_writes();
         let ran = self.topology != RECTANGLES && self.prepare(list, true);
         if ran {
+            list.commit_gpu_writes(mark);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -1202,6 +1214,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
+            list.discard_gpu_writes(mark);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
@@ -1363,6 +1376,7 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        let mark = list.mark_gpu_writes();
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -1373,6 +1387,8 @@ impl State {
             _ => false,
         };
         if !ran {
+            list.discard_gpu_writes(mark);
+            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1383,6 +1399,7 @@ impl State {
             }
             return false;
         }
+        list.commit_gpu_writes(mark);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(
@@ -1394,8 +1411,20 @@ impl State {
             // The cache can evict this signature before the list runs.
             list.keep(&signature);
         }
+        let count_uav = counter.as_ref().and_then(|(s, _)| {
+            (!std::sync::Arc::ptr_eq(s, &args) && list.is_unordered(&s.buffer)).then_some(&s.buffer)
+        });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), and the signature is live.
+        unsafe {
+            if let Some(buf) = count_uav {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    buf,
+                    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+            }
+        }
         crate::indirect::execute(
             list,
             &signature,
@@ -1403,6 +1432,16 @@ impl State {
             (&args.buffer, args.offset(arguments)),
             counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
         );
+        // SAFETY: restore UAV state on count buffer if needed.
+        unsafe {
+            if let Some(buf) = count_uav {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    buf,
+                    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+        }
         // ExecuteIndirect zeroes the constants it sets. Mirror that in
         // the title state so the next bind doesn't restore stale values.
         for &[_, slot, dest, dwords] in &guest_args[..guest_args.len() - 1] {
