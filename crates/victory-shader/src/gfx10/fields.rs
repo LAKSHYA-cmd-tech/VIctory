@@ -818,7 +818,6 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     whole + gradients + coordinates
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1957,6 +1956,5 @@ mod tests {
         assert_eq!(target, 12);
         assert_eq!(src, [Some(vgpr(4, 1)), None, Some(vgpr(6, 1)), None]);
         assert!(!compr && !done && !vm);
-
     }
 }

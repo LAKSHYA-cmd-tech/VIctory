@@ -44,10 +44,8 @@ pub fn run(
     );
     // The title's watchdog writes a breadcrumb through a null pointer (see
     // `redirect_null_write`); point those writes at a page of ours first.
-    let redirected = victory_gpu::redirect_null_write(
-        image.base(),
-        image.info().size_of_image as usize,
-    );
+    let redirected =
+        victory_gpu::redirect_null_write(image.base(), image.info().size_of_image as usize);
     if redirected > 0 {
         println!("null write     {redirected} instruction(s) pointed at a low page");
     }

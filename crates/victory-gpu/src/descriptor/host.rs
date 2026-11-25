@@ -211,9 +211,13 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if count + DYNAMIC + aliases + guard <= PORTABLE_VIEWS && let Ok(heap) = make(count + DYNAMIC + aliases + guard) {
+        } else if count + DYNAMIC + aliases + guard <= PORTABLE_VIEWS
+            && let Ok(heap) = make(count + DYNAMIC + aliases + guard)
+        {
             (heap, count, DYNAMIC)
-        } else if count + MIN_DYNAMIC + aliases + guard <= PORTABLE_VIEWS && let Ok(heap) = make(count + MIN_DYNAMIC + aliases + guard) {
+        } else if count + MIN_DYNAMIC + aliases + guard <= PORTABLE_VIEWS
+            && let Ok(heap) = make(count + MIN_DYNAMIC + aliases + guard)
+        {
             (heap, count, MIN_DYNAMIC)
         } else {
             // shortcut: descriptors past the host's limit are left
@@ -300,11 +304,13 @@ impl HostHeap {
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
-host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: block_size,
-                    ..Default::default()
-                })?;            let start = block.GetCPUDescriptorHandleForHeapStart();
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: block_size,
+                        ..Default::default()
+                    })?;
+            let start = block.GetCPUDescriptorHandleForHeapStart();
             let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: start.ptr + (i * self.step) as usize,
             };
@@ -314,14 +320,18 @@ host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 null_view(start);
             }
             let mut filled = 1;
-while filled < block_size {
+            while filled < block_size {
                 let n = filled.min(block_size - filled);
-                host.device.CopyDescriptorsSimple(n, at(filled), start, kind);                filled += n;
+                host.device
+                    .CopyDescriptorsSimple(n, at(filled), start, kind);
+                filled += n;
             }
             let mut done = 0;
             while done < total {
-let n = block_size.min(total - done);
-                host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);                done += n;
+                let n = block_size.min(total - done);
+                host.device
+                    .CopyDescriptorsSimple(n, self.cpu(done), start, kind);
+                done += n;
             }
         }
         Ok(())
@@ -872,7 +882,11 @@ impl HostHeap {
             // shortcut: a view starting off a dword of its host copy (an
             // element size that is not a multiple of 4) has no raw view; a
             // raw load could not address its bytes either.
-            once!(start, len, "a buffer view off the dwords of its host copy has no raw view");
+            once!(
+                start,
+                len,
+                "a buffer view off the dwords of its host copy has no raw view"
+            );
             self.unalias(index);
             return (self.null_alias(unordered), 0);
         };
@@ -888,9 +902,7 @@ impl HostHeap {
                 }),
             };
             let Some(slot) = slot else {
-                once!(
-                    "no free raw view slots: a buffer read without a known stride reads zeros"
-                );
+                once!("no free raw view slots: a buffer read without a known stride reads zeros");
                 return (self.null_alias(unordered), 0);
             };
             a.of.insert(index, slot);
@@ -1001,8 +1013,13 @@ fn viewed_bytes(view: &View, kept: Option<&ID3D12Resource>) -> Viewed {
         let desc = uav_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
-        (b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0)
-            .then(|| (b.FirstElement, b.NumElements, uav_element_size(&desc).unwrap_or(0)))
+        (b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0).then(|| {
+            (
+                b.FirstElement,
+                b.NumElements,
+                uav_element_size(&desc).unwrap_or(0),
+            )
+        })
     } else {
         let desc = srv_desc(words);
         // SAFETY: a buffer view's union member.
@@ -1387,10 +1404,7 @@ pub(crate) fn adapt_view_format(
     }
     if let Some(format) = format {
         if !typeless {
-            let is_srgb_uav = unordered
-                && crate::resource::SRGB
-                    .iter()
-                    .any(|&(s, _)| s == own);
+            let is_srgb_uav = unordered && crate::resource::SRGB.iter().any(|&(s, _)| s == own);
             if !is_srgb_uav {
                 *format = DXGI_FORMAT(own as i32);
             }
@@ -1567,19 +1581,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if !fits(device, texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
-                // SAFETY: a live texture and a slot of our heap.
-                unsafe {
-                    device.CreateUnorderedAccessView(
-                        texture,
-                        None::<&ID3D12Resource>,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    )
-                };
-                Some(Kept::Resource {
-                    resource: texture.clone(),
-                    copy: None,
-                })
+            // SAFETY: a live texture and a slot of our heap.
+            unsafe {
+                device.CreateUnorderedAccessView(
+                    texture,
+                    None::<&ID3D12Resource>,
+                    desc.as_ref().map(std::ptr::from_ref),
+                    at,
+                )
+            };
+            Some(Kept::Resource {
+                resource: texture.clone(),
+                copy: None,
+            })
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -1633,7 +1647,11 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
     if *unordered {
-        Some(View::Unordered(texture as usize, 0, desc[..10].try_into().ok()))
+        Some(View::Unordered(
+            texture as usize,
+            0,
+            desc[..10].try_into().ok(),
+        ))
     } else {
         Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
     }
@@ -1910,7 +1928,10 @@ mod tests {
             assert!(!kept(1), "a view of no elements (unordered: {unordered})");
             // SAFETY: a plain device query.
             let removed = unsafe { host.device.GetDeviceRemovedReason() };
-            assert!(removed.is_ok(), "device removed: {removed:?} (unordered: {unordered})");
+            assert!(
+                removed.is_ok(),
+                "device removed: {removed:?} (unordered: {unordered})"
+            );
         }
         crate::shadow::unregister(usize::MAX - 1, address);
     }

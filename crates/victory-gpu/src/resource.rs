@@ -842,8 +842,7 @@ impl Resource {
                     .as_ref()
                     .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
                 let texture = host_texture(&self.desc, state, clear)?;
-                let state =
-                    crate::host::legal_state(&texture, crate::host::texture_state(state));
+                let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
@@ -983,7 +982,10 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                d.width, d.height, d.format, d.flags
+            )
         });
     }
     texture
@@ -1266,8 +1268,9 @@ pub(crate) extern "system" fn create_at_address(
 /// description viewed); release them when the title unmaps or reuses the
 /// memory once streaming grows VRAM use.
 #[cfg(windows)]
-pub(crate) static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+pub(crate) static PLACED_TEXTURES: std::sync::Mutex<
+    std::collections::BTreeMap<(u64, [u32; 14]), usize>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
@@ -2234,14 +2237,20 @@ mod tests {
         let mut desc = b5g5r5a1;
         desc.flags = 4; // UNORDERED
         let res = host_texture(&desc, 0, std::ptr::null());
-        assert!(res.is_some(), "B5G5R5A1 texture creation succeeded without UAV");
+        assert!(
+            res.is_some(),
+            "B5G5R5A1 texture creation succeeded without UAV"
+        );
 
         // B4G4R4A4 with RenderTarget
         let b4g4r4a4 = texture(64, 64, 115, 1);
         let mut desc2 = b4g4r4a4;
         desc2.flags = 1; // RENDER_TARGET
         let res2 = host_texture(&desc2, 0, std::ptr::null());
-        assert!(res2.is_some(), "B4G4R4A4 texture creation succeeded without RenderTarget");
+        assert!(
+            res2.is_some(),
+            "B4G4R4A4 texture creation succeeded without RenderTarget"
+        );
     }
 
     #[test]

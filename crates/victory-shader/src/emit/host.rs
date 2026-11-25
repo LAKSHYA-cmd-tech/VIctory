@@ -1349,9 +1349,13 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
-                            View::BufferUav(n, Stride::Structured(s)) => {
-                                (n, DXGI_FORMAT_UNKNOWN, n * 4 / s, s, D3D12_BUFFER_UAV_FLAG_NONE)
-                            }
+                            View::BufferUav(n, Stride::Structured(s)) => (
+                                n,
+                                DXGI_FORMAT_UNKNOWN,
+                                n * 4 / s,
+                                s,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
                             View::BufferUav(n, Stride::Format(f, bytes)) => {
                                 (n, f, n * 4 / bytes, 0, D3D12_BUFFER_UAV_FLAG_NONE)
                             }

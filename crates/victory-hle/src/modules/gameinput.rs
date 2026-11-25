@@ -112,14 +112,7 @@ trait Source: Send {
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right), left trigger, right trigger.
-    fn rumble(
-        &mut self,
-        slot: usize,
-        low: u16,
-        high: u16,
-        left_trigger: u16,
-        right_trigger: u16,
-    );
+    fn rumble(&mut self, slot: usize, low: u16, high: u16, left_trigger: u16, right_trigger: u16);
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -825,7 +818,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -1203,22 +1199,24 @@ mod host {
             type XInputSetStateExFn =
                 unsafe extern "system" fn(u32, *const XInputVibrationEx) -> u32;
 
-            static XINPUT_SET_STATE_EX: LazyLock<Option<XInputSetStateExFn>> = LazyLock::new(|| {
-                use windows_sys::Win32::System::LibraryLoader::{
-                    GetModuleHandleA, GetProcAddress, LoadLibraryA,
-                };
-                unsafe {
-                    let mut handle = GetModuleHandleA(b"xinput1_4.dll\0".as_ptr());
-                    if handle.is_null() {
-                        handle = LoadLibraryA(b"xinput1_4.dll\0".as_ptr());
+            static XINPUT_SET_STATE_EX: LazyLock<Option<XInputSetStateExFn>> =
+                LazyLock::new(|| {
+                    use windows_sys::Win32::System::LibraryLoader::{
+                        GetModuleHandleA, GetProcAddress, LoadLibraryA,
+                    };
+                    // SAFETY: loading module handle and resolving dynamic ordinal.
+                    unsafe {
+                        let mut handle = GetModuleHandleA(c"xinput1_4.dll".as_ptr().cast());
+                        if handle.is_null() {
+                            handle = LoadLibraryA(c"xinput1_4.dll".as_ptr().cast());
+                        }
+                        if handle.is_null() {
+                            return None;
+                        }
+                        let proc = GetProcAddress(handle, 100 as *const u8);
+                        proc.map(|p| std::mem::transmute::<_, XInputSetStateExFn>(p))
                     }
-                    if handle.is_null() {
-                        return None;
-                    }
-                    let proc = GetProcAddress(handle, 100 as *const u8);
-                    proc.map(|p| std::mem::transmute::<_, XInputSetStateExFn>(p))
-                }
-            });
+                });
 
             if let Some(set_state_ex) = *XINPUT_SET_STATE_EX {
                 let speeds_ex = XInputVibrationEx {
@@ -1228,6 +1226,7 @@ mod host {
                     wRightTriggerMotorSpeed: right_trigger,
                 };
                 // Ordinal 100 succeeds with ERROR_SUCCESS (0).
+                // SAFETY: calling valid dynamic XInputSetStateEx pointer.
                 if unsafe { set_state_ex(slot as u32, &speeds_ex) } == 0 {
                     return;
                 }
@@ -1633,7 +1632,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1642,7 +1650,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
@@ -1681,12 +1692,10 @@ mod tests {
         rumble(device, std::ptr::null());
         assert_eq!(
             host.lock().unwrap().rumble,
-            [
-                (2, 32767, 65535, 16383, 49151),
-                (2, 0, 0, 0, 0),
-            ]
+            [(2, 32767, 65535, 16383, 49151), (2, 0, 0, 0, 0),]
         );
 
+        // SAFETY: valid pointer to DeviceInfo struct inside test hub.
         let motors = unsafe {
             *(info(device).add(std::mem::offset_of!(DeviceInfo, rumble_motors)) as *const u32)
         };

@@ -6,7 +6,7 @@
 //! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and the
 //! layouts `tbuffer_store_format_*` writes.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -29,12 +29,17 @@ const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
         | src0 as u32
 }
 
-/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
-const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
+/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], offset` (soffset = null).
+const fn s_load_dwordx4_at(dst: u8, base: u8, offset: u32) -> [u32; 2] {
     [
         0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
-        125 << 25,
+        125 << 25 | (offset & 0x1F_FFFF),
     ]
+}
+
+/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
+const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
+    s_load_dwordx4_at(dst, base, 0)
 }
 
 /// VOP1 `op vdst, src0` (`src0`: 0..105 = SGPR, 256..511 = VGPR).
@@ -55,6 +60,22 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     [
         0x38 << 26 | 0x1C << 18 | (byte_off as u32 & 0xFFF),
         0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+/// MUBUF `buffer_store_dwordx4 v[vdata:vdata+3], off, s[srsrc:srsrc+3], 0 offset:byte_off`.
+const fn buffer_store_dwordx4(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1E << 18 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+/// MTBUF `tbuffer_load_format_{x,xy,xyz,xyzw}` with `offen`, `soffset = 0`, `offset = 0`.
+const fn tbuffer_load_format(op: u8, format: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x3A << 26 | (format as u32 & 0x7F) << 19 | (op as u32 & 7) << 16 | 1 << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
     ]
 }
 
@@ -885,7 +906,6 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     });
 }
 
-
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
@@ -1369,13 +1389,7 @@ fn v_cndmask_b32_modifiers_are_bitwise() {
 }
 
 /// EXP `exp target, v0, v1, v2, v3 [done] [vm]` (`en`: 4-bit channel mask).
-const fn exp_inst(
-    target: u8,
-    en: u8,
-    v: [u8; 4],
-    done: bool,
-    vm: bool,
-) -> [u32; 2] {
+const fn exp_inst(target: u8, en: u8, v: [u8; 4], done: bool, vm: bool) -> [u32; 2] {
     let w0 = 0x3E << 26
         | (vm as u32) << 12
         | (done as u32) << 11
@@ -1732,7 +1746,12 @@ fn image_store_partial_dmask_writes_expected_channels() {
 
     // (dmask, d16, input root constants, expected channels written)
     let cases: &[(u8, bool, [u32; 4], &[f32])] = &[
-        (0x0, false, [1.5f32.to_bits(), 0, 0, 0], &[0.0, 0.0, 0.0, 0.0]),
+        (
+            0x0,
+            false,
+            [1.5f32.to_bits(), 0, 0, 0],
+            &[0.0, 0.0, 0.0, 0.0],
+        ),
         (0x1, false, [1.5f32.to_bits(), 0, 0, 0], &[1.5]),
         (
             0x3,
@@ -1743,18 +1762,18 @@ fn image_store_partial_dmask_writes_expected_channels() {
         (
             0x7,
             false,
-            [
-                1.5f32.to_bits(),
-                (-2.25f32).to_bits(),
-                4.0f32.to_bits(),
-                0,
-            ],
+            [1.5f32.to_bits(), (-2.25f32).to_bits(), 4.0f32.to_bits(), 0],
             &[1.5, -2.25, 4.0],
         ),
         // d16: 1.5 (0x3E00) in low half, -2.0 (0xC000) in high half, 4.0 (0x4400) in next VGPR.
         (0x1, true, [0x0000_3E00, 0, 0, 0], &[1.5]),
         (0x3, true, [0xC000_3E00, 0, 0, 0], &[1.5, -2.0]),
-        (0x7, true, [0xC000_3E00, 0x0000_4400, 0, 0], &[1.5, -2.0, 4.0]),
+        (
+            0x7,
+            true,
+            [0xC000_3E00, 0x0000_4400, 0, 0],
+            &[1.5, -2.0, 4.0],
+        ),
     ];
 
     let shaders: Vec<HostShader> = cases
@@ -1909,7 +1928,14 @@ fn v_mad_16_and_int16_clamp_match_rdna2() {
     ];
     let i_in: Vec<[u32; 4]> = i_cases
         .iter()
-        .map(|&(a, b, c, _, _)| [u32::from(a as u16), u32::from(b as u16), u32::from(c as u16), sentinel])
+        .map(|&(a, b, c, _, _)| {
+            [
+                u32::from(a as u16),
+                u32::from(b as u16),
+                u32::from(c as u16),
+                sentinel,
+            ]
+        })
         .collect();
     run_cases(&mad_i16_wrap, &i_in, |backend, i, _, got| {
         let want = sentinel | u32::from(i_cases[i].3 as u16);
@@ -1923,10 +1949,7 @@ fn v_mad_16_and_int16_clamp_match_rdna2() {
     // v_add_nc_u16 clamp & v_sub_nc_u16 clamp
     run_cases(
         &add_u16_sat,
-        &[
-            [60000, 10000, 0, sentinel],
-            [123, 456, 0, sentinel],
-        ],
+        &[[60000, 10000, 0, sentinel], [123, 456, 0, sentinel]],
         |backend, i, _, got| {
             let want = sentinel | [u32::from(u16::MAX), 579][i];
             assert_eq!(got, want, "{backend}: v_add_nc_u16 clamp case {i}");
@@ -1934,10 +1957,7 @@ fn v_mad_16_and_int16_clamp_match_rdna2() {
     );
     run_cases(
         &sub_u16_sat,
-        &[
-            [5, 10, 0, sentinel],
-            [500, 200, 0, sentinel],
-        ],
+        &[[5, 10, 0, sentinel], [500, 200, 0, sentinel]],
         |backend, i, _, got| {
             let want = sentinel | [0, 300][i];
             assert_eq!(got, want, "{backend}: v_sub_nc_u16 clamp case {i}");
@@ -1970,21 +1990,21 @@ fn v_ldexp_f16_matches_rdna2() {
     let sentinel = 0xCAFE_0000u32;
     // (f16 input, i16 exponent, expected f16 output)
     let cases: &[(u16, i16, u16)] = &[
-        (0x3C00, 0, 0x3C00),         // 1.0 * 2^0 = 1.0
-        (0x3E00, 3, 0x4A00),         // 1.5 * 2^3 = 12.0
-        (0xC200, -2, 0xBA00),        // -3.0 * 2^-2 = -0.75
-        (0x3C00, -15, 0x0200),       // 1.0 * 2^-15 = f16 subnormal 0x0200
-        (0x0001, 24, 0x3C00),        // min f16 subnormal (2^-24) * 2^24 = 1.0
-        (0x7BFF, 0, 0x7BFF),         // max finite f16 * 2^0 stays 65504 (no premature inf)
-        (0x3C00, 16, 0x7C00),        // 1.0 * 2^16 = 65536 -> +inf (RTE overflow)
-        (0xBC00, 1000, 0xFC00),      // -1.0 * 2^1000 -> -inf
-        (0x0001, i16::MAX, 0x7C00),  // min subnormal * 2^32767 -> +inf
-        (0x7BFF, i16::MIN, 0x0000),  // max finite * 2^-32768 -> +0.0
-        (0xFBFF, i16::MIN, 0x8000),  // -max finite * 2^-32768 -> -0.0
-        (0x0000, i16::MAX, 0x0000),  // +0.0 * 2^32767 = +0.0 (not NaN)
-        (0x8000, i16::MAX, 0x8000),  // -0.0 * 2^32767 = -0.0 (not NaN)
-        (0x7C00, i16::MIN, 0x7C00),  // +inf * 2^-32768 = +inf (not NaN)
-        (0xFC00, i16::MIN, 0xFC00),  // -inf * 2^-32768 = -inf (not NaN)
+        (0x3C00, 0, 0x3C00),        // 1.0 * 2^0 = 1.0
+        (0x3E00, 3, 0x4A00),        // 1.5 * 2^3 = 12.0
+        (0xC200, -2, 0xBA00),       // -3.0 * 2^-2 = -0.75
+        (0x3C00, -15, 0x0200),      // 1.0 * 2^-15 = f16 subnormal 0x0200
+        (0x0001, 24, 0x3C00),       // min f16 subnormal (2^-24) * 2^24 = 1.0
+        (0x7BFF, 0, 0x7BFF),        // max finite f16 * 2^0 stays 65504 (no premature inf)
+        (0x3C00, 16, 0x7C00),       // 1.0 * 2^16 = 65536 -> +inf (RTE overflow)
+        (0xBC00, 1000, 0xFC00),     // -1.0 * 2^1000 -> -inf
+        (0x0001, i16::MAX, 0x7C00), // min subnormal * 2^32767 -> +inf
+        (0x7BFF, i16::MIN, 0x0000), // max finite * 2^-32768 -> +0.0
+        (0xFBFF, i16::MIN, 0x8000), // -max finite * 2^-32768 -> -0.0
+        (0x0000, i16::MAX, 0x0000), // +0.0 * 2^32767 = +0.0 (not NaN)
+        (0x8000, i16::MAX, 0x8000), // -0.0 * 2^32767 = -0.0 (not NaN)
+        (0x7C00, i16::MIN, 0x7C00), // +inf * 2^-32768 = +inf (not NaN)
+        (0xFC00, i16::MIN, 0xFC00), // -inf * 2^-32768 = -inf (not NaN)
     ];
     let inputs: Vec<[u32; 4]> = cases
         .iter()
@@ -2000,18 +2020,31 @@ fn v_ldexp_f16_matches_rdna2() {
     });
 
     // NaN stays NaN (upper half preserved).
-    run_cases(&vop2_cs, &[[0x7E00, 4, sentinel, 0]], |backend, _, _, got| {
-        assert_eq!(got & 0xFFFF_0000, sentinel);
-        let lo = (got & 0x7FFF) as u16;
-        assert!(lo > 0x7C00, "{backend}: v_ldexp_f16(NaN, 4) lo={lo:#06x}, want NaN");
-    });
+    run_cases(
+        &vop2_cs,
+        &[[0x7E00, 4, sentinel, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got & 0xFFFF_0000, sentinel);
+            let lo = (got & 0x7FFF) as u16;
+            assert!(
+                lo > 0x7C00,
+                "{backend}: v_ldexp_f16(NaN, 4) lo={lo:#06x}, want NaN"
+            );
+        },
+    );
 
     // VOP3 abs[0] + opsel:[1,0,0,1] + clamp:
     // |-0.25(=0xB400)| * 2^1 = 0.5 (0x3800) into high half; |-1.0(=0xBC00)| * 2^2 = 4.0 -> clamped 1.0 (0x3C00)
     let lo_sentinel = 0x0000_1234u32;
     let vop3_cases: &[([u32; 4], u32)] = &[
-        ([0xB400_0000, 1, lo_sentinel, 0], (0x3800u32 << 16) | lo_sentinel),
-        ([0xBC00_0000, 2, lo_sentinel, 0], (0x3C00u32 << 16) | lo_sentinel),
+        (
+            [0xB400_0000, 1, lo_sentinel, 0],
+            (0x3800u32 << 16) | lo_sentinel,
+        ),
+        (
+            [0xBC00_0000, 2, lo_sentinel, 0],
+            (0x3C00u32 << 16) | lo_sentinel,
+        ),
     ];
     let vop3_in: Vec<[u32; 4]> = vop3_cases.iter().map(|c| c.0).collect();
     run_cases(&vop3_cs, &vop3_in, |backend, i, _, got| {
@@ -2281,7 +2314,15 @@ fn valu16_min3_max3_med3_and_mad32_16_match_rdna2() {
     let mad_u32 = build_valu_cs(&vop3_mod(0x373, 0, false, 0, vgpr(1), vgpr(2), vgpr(3)));
     let mad_u32_clamp = build_valu_cs(&vop3_mod(0x373, 0, true, 0, vgpr(1), vgpr(2), vgpr(3)));
     // op_sel = 0b0010 => src0=lo, src1=hi
-    let mad_u32_hi1 = build_valu_cs(&vop3_mod(0x373, 0b0010, false, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let mad_u32_hi1 = build_valu_cs(&vop3_mod(
+        0x373,
+        0b0010,
+        false,
+        0,
+        vgpr(1),
+        vgpr(2),
+        vgpr(3),
+    ));
     let mad_i32 = build_valu_cs(&vop3_mod(0x375, 0, false, 0, vgpr(1), vgpr(2), vgpr(3)));
     let mad_i32_clamp = build_valu_cs(&vop3_mod(0x375, 0, true, 0, vgpr(1), vgpr(2), vgpr(3)));
 
@@ -2303,13 +2344,21 @@ fn valu16_min3_max3_med3_and_mad32_16_match_rdna2() {
         assert_eq!(g, u32_cases[i].2, "{b}: v_mad_u32_u16 clamp case {i}");
     });
     // src0.lo = 10, src1.hi = 20, acc = 3 => 203.
-    run_cases(&mad_u32_hi1, &[[0x9999_000A, 0x0014_8888, 3, 0]], |b, _, _, g| {
-        assert_eq!(g, 203, "{b}: v_mad_u32_u16 opsel=0b0010");
-    });
+    run_cases(
+        &mad_u32_hi1,
+        &[[0x9999_000A, 0x0014_8888, 3, 0]],
+        |b, _, _, g| {
+            assert_eq!(g, 203, "{b}: v_mad_u32_u16 opsel=0b0010");
+        },
+    );
 
     let i32_cases: &[([u32; 4], u32, u32)] = &[
         // (-100) * 50 + 20 = -4980
-        ([0x0000_FF9C, 0x0000_0032, 20, 0], (-4980i32) as u32, (-4980i32) as u32),
+        (
+            [0x0000_FF9C, 0x0000_0032, 20, 0],
+            (-4980i32) as u32,
+            (-4980i32) as u32,
+        ),
         // (-32768) * (-32768) + i32::MAX => +2^30 + (2^31 - 1), positive overflow -> i32::MAX
         (
             [0x0000_8000, 0x0000_8000, i32::MAX as u32, 0],
@@ -2330,4 +2379,370 @@ fn valu16_min3_max3_med3_and_mad32_16_match_rdna2() {
     run_cases(&mad_i32_clamp, &i32_in, |b, i, _, g| {
         assert_eq!(g, i32_cases[i].2, "{b}: v_mad_i32_i16 clamp case {i}");
     });
+}
+
+fn build_tbuffer_load_cs(op: u8, format: u8) -> HostShader {
+    let mut words = Vec::new();
+    // s[4:5] = descriptor table address (heap index 0 = SRV, index 1 = UAV).
+    words.push(s_mov_b32(5, 0x80)); // inline constant 0
+    words.extend_from_slice(&s_load_dwordx4_at(8, 4, 0));
+    words.extend_from_slice(&s_load_dwordx4_at(12, 4, 32));
+    // v4 = byte offset (s0); initialize v0..v3 with sentinel (s1) to verify
+    // partial loads (_xy, _xyz) do not clobber unloaded VGPRs.
+    words.push(vop1(0x001, 4, sgpr(0)));
+    for r in 0..4u8 {
+        words.push(vop1(0x001, r, sgpr(1)));
+    }
+    words.extend_from_slice(&tbuffer_load_format(op, format, 0, 4, 8));
+    words.extend_from_slice(&buffer_store_dwordx4(0, 12, 0));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        options: Default::default(),
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        address_srvs: lowered.address_srvs,
+        stride_table: lowered.stride_table,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+#[test]
+fn tbuffer_load_format_zero_pads_missing_channels() {
+    const SENTINEL: u32 = 0xDEAD_BEEF;
+    let f = f32::to_bits;
+
+    struct Case<'a> {
+        name: &'a str,
+        op: u8,
+        format: u8,
+        data: &'a [u32],
+        reads: &'a [(u32, [u32; 4])],
+    }
+
+    let suite: &[Case] = &[
+        // 1-channel formats (_xyzw): channels 1..4 must be strictly 0 (not 1/1.0 in .w).
+        Case {
+            name: "8_UNORM_xyzw",
+            op: 3,
+            format: 1,
+            data: &[0x0056_34FF],
+            reads: &[(0, [f(1.0), 0, 0, 0]), (3, [f(0.0), 0, 0, 0])],
+        },
+        Case {
+            name: "8_UINT_xyzw",
+            op: 3,
+            format: 5,
+            data: &[0x0000_2A00],
+            reads: &[(1, [42, 0, 0, 0])],
+        },
+        Case {
+            name: "8_SINT_xyzw",
+            op: 3,
+            format: 6,
+            data: &[0x00FE_0000],
+            reads: &[(2, [(-2i32) as u32, 0, 0, 0])],
+        },
+        Case {
+            name: "16_FLOAT_xyzw",
+            op: 3,
+            format: 13,
+            data: &[0xC000_3C00],
+            reads: &[(0, [f(1.0), 0, 0, 0]), (2, [f(-2.0), 0, 0, 0])],
+        },
+        Case {
+            name: "32_UINT_xyzw",
+            op: 3,
+            format: 20,
+            data: &[0x1234_5678],
+            reads: &[(0, [0x1234_5678, 0, 0, 0])],
+        },
+        Case {
+            name: "32_SINT_xyzw",
+            op: 3,
+            format: 21,
+            data: &[(-74i32) as u32],
+            reads: &[(0, [(-74i32) as u32, 0, 0, 0])],
+        },
+        Case {
+            name: "32_FLOAT_xyzw",
+            op: 3,
+            format: 22,
+            data: &[f(42.5)],
+            reads: &[(0, [f(42.5), 0, 0, 0])],
+        },
+        // 2-channel formats (_xyzw): channels 2..4 must be strictly 0.
+        Case {
+            name: "8_8_UNORM_xyzw",
+            op: 3,
+            format: 14,
+            data: &[0xFF00_00FF],
+            reads: &[(0, [f(1.0), f(0.0), 0, 0]), (2, [f(0.0), f(1.0), 0, 0])],
+        },
+        Case {
+            name: "16_16_SNORM_xyzw",
+            op: 3,
+            format: 24,
+            data: &[0x8000_7FFF],
+            reads: &[(0, [f(1.0), f(-1.0), 0, 0])],
+        },
+        Case {
+            name: "16_16_FLOAT_xyzw",
+            op: 3,
+            format: 29,
+            data: &[0xC000_3C00],
+            reads: &[(0, [f(1.0), f(-2.0), 0, 0])],
+        },
+        Case {
+            name: "32_32_UINT_xyzw",
+            op: 3,
+            format: 62,
+            data: &[0xDEAD_0001, 0xBEEF_0002],
+            reads: &[(0, [0xDEAD_0001, 0xBEEF_0002, 0, 0])],
+        },
+        Case {
+            name: "32_32_FLOAT_xyzw",
+            op: 3,
+            format: 64,
+            data: &[f(1.5), f(-3.25)],
+            reads: &[(0, [f(1.5), f(-3.25), 0, 0])],
+        },
+        // 3-channel formats (_xyzw): channel 3 (.w) must be strictly 0.
+        Case {
+            name: "10_11_11_FLOAT_xyzw",
+            op: 3,
+            format: 36,
+            data: &[0x7820_0440],
+            reads: &[(0, [f(4.0), f(2.0), f(1.0), 0])],
+        },
+        Case {
+            name: "11_11_10_FLOAT_xyzw",
+            op: 3,
+            format: 43,
+            data: &[0x8810_01E0],
+            reads: &[(0, [f(1.0), f(2.0), f(4.0), 0])],
+        },
+        Case {
+            name: "32_32_32_UINT_xyzw",
+            op: 3,
+            format: 72,
+            data: &[10, 20, 30],
+            reads: &[(0, [10, 20, 30, 0])],
+        },
+        Case {
+            name: "32_32_32_SINT_xyzw",
+            op: 3,
+            format: 73,
+            data: &[(-1i32) as u32, (-2i32) as u32, 3],
+            reads: &[(0, [(-1i32) as u32, (-2i32) as u32, 3, 0])],
+        },
+        Case {
+            name: "32_32_32_FLOAT_xyzw",
+            op: 3,
+            format: 74,
+            data: &[f(1.0), f(2.0), f(-3.0)],
+            reads: &[(0, [f(1.0), f(2.0), f(-3.0), 0])],
+        },
+        // Partial loads (_xyz, _xy) and 4-channel controls.
+        Case {
+            name: "8_UNORM_xyz",
+            op: 2,
+            format: 1,
+            data: &[0x0000_00FF],
+            reads: &[(0, [f(1.0), 0, 0, SENTINEL])],
+        },
+        Case {
+            name: "16_16_FLOAT_xyz",
+            op: 2,
+            format: 29,
+            data: &[0xC000_3C00],
+            reads: &[(0, [f(1.0), f(-2.0), 0, SENTINEL])],
+        },
+        Case {
+            name: "8_8_8_8_UNORM_xyz",
+            op: 2,
+            format: 56,
+            data: &[0xFF00_FFFF],
+            reads: &[(0, [f(1.0), f(1.0), f(0.0), SENTINEL])],
+        },
+        Case {
+            name: "8_UNORM_xy",
+            op: 1,
+            format: 1,
+            data: &[0x0000_00FF],
+            reads: &[(0, [f(1.0), 0, SENTINEL, SENTINEL])],
+        },
+        Case {
+            name: "32_32_32_FLOAT_xy",
+            op: 1,
+            format: 74,
+            data: &[f(1.0), f(2.0), f(-3.0)],
+            reads: &[(0, [f(1.0), f(2.0), SENTINEL, SENTINEL])],
+        },
+        Case {
+            name: "32_32_32_32_FLOAT_xy",
+            op: 1,
+            format: 77,
+            data: &[f(1.0), f(-2.0), f(3.5), f(-4.25)],
+            reads: &[(0, [f(1.0), f(-2.0), SENTINEL, SENTINEL])],
+        },
+        Case {
+            name: "8_8_8_8_UNORM_xyzw",
+            op: 3,
+            format: 56,
+            data: &[0xFF00_FF00],
+            reads: &[(0, [f(0.0), f(1.0), f(0.0), f(1.0)])],
+        },
+        Case {
+            name: "32_32_32_32_FLOAT_xyzw",
+            op: 3,
+            format: 77,
+            data: &[f(1.0), f(-2.0), f(3.5), f(-4.25)],
+            reads: &[(0, [f(1.0), f(-2.0), f(3.5), f(-4.25)])],
+        },
+    ];
+
+    let compiled: Vec<(&Case, HostShader)> = suite
+        .iter()
+        .map(|case| (case, build_tbuffer_load_cs(case.op, case.format)))
+        .collect();
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {backend} device; skipped");
+            continue;
+        };
+        for &(case, ref shader) in &compiled {
+            let (root, pso) = host.compute_pipeline(shader).unwrap_or_else(|e| {
+                panic!("{backend}: {}: compute_pipeline failed: {e}", case.name)
+            });
+            for &(byte_off, want) in case.reads {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Constants, 0) => match u.dword {
+                            0 => byte_off,
+                            1 => SENTINEL,
+                            _ => 0,
+                        },
+                        (RootType::Table, 1) => 0,
+                        (RootType::ResourceHeap, _) => {
+                            super::host::guard(u.root, 2, 0).unwrap_or(0)
+                        }
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[
+                                View::Buffer {
+                                    data: case.data,
+                                    stride: Stride::Raw,
+                                },
+                                View::RawUav(4),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{backend}: {}: dispatch failed: {e}", case.name));
+                let got: [u32; 4] = out[0][..4].try_into().expect("4 dwords");
+                assert_eq!(
+                    got, want,
+                    "{backend}: {} @ off {byte_off}: got {got:#010x?}, want {want:#010x?}",
+                    case.name,
+                );
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }

@@ -139,7 +139,9 @@ fn normalized_mtbuf_loads_round_every_field_value() {
                 let (root, pso) = host.compute_pipeline(&shader).unwrap();
                 let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
                 for u in &shader.user_data {
-                    if let crate::native::RootType::ResourceHeap | crate::native::RootType::SamplerHeap = u.root {
+                    if let crate::native::RootType::ResourceHeap
+                    | crate::native::RootType::SamplerHeap = u.root
+                    {
                         ud[u.index as usize] = u32::MAX;
                     }
                 }

@@ -514,7 +514,10 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() || !self.address_srvs.is_empty() || self.stride_table.is_some() {
+            if !self.root_srvs.is_empty()
+                || !self.address_srvs.is_empty()
+                || self.stride_table.is_some()
+            {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);

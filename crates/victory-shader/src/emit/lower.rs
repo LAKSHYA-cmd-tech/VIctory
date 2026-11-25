@@ -759,10 +759,8 @@ pub(super) fn plan_lds_fences(p: &Program, uniform: &[bool]) -> Result<LdsFences
         let mut changed = false;
         for &b in &order {
             if !uniform[b] {
-                let next_r =
-                    has_read[b] || p.blocks[b].preds.iter().any(|&q| pending_read[q]);
-                let next_w =
-                    has_write[b] || p.blocks[b].preds.iter().any(|&q| pending_write[q]);
+                let next_r = has_read[b] || p.blocks[b].preds.iter().any(|&q| pending_read[q]);
+                let next_w = has_write[b] || p.blocks[b].preds.iter().any(|&q| pending_write[q]);
                 if next_r && !pending_read[b] {
                     pending_read[b] = true;
                     changed = true;
@@ -952,9 +950,11 @@ impl<'a> Lower<'a> {
                             | "v_subrev_co_ci_u32"
                     ) && match &i.fields {
                         Fields::Valu(v) => match v.src.get(2) {
-                            Some(&Operand::Scalar { code, .. }) => i
-                                .read(Reg::S(code))
-                                .is_none_or(|m| !x.st.masks.contains_key(&m) && !x.st.other.contains_key(&m)),
+                            Some(&Operand::Scalar { code, .. }) => {
+                                i.read(Reg::S(code)).is_none_or(|m| {
+                                    !x.st.masks.contains_key(&m) && !x.st.other.contains_key(&m)
+                                })
+                            }
                             _ => false,
                         },
                         _ => false,
@@ -2423,7 +2423,12 @@ impl<'a> Lower<'a> {
         if m == crate::structure::Bool::TRUE {
             return Ok(self.s.m.i32(u32::MAX));
         }
-        if let Some((crate::structure::Atom::Constant(k), crate::structure::Bool::FALSE, crate::structure::Bool::TRUE)) = self.x.st.bools.node(m) {
+        if let Some((
+            crate::structure::Atom::Constant(k),
+            crate::structure::Bool::FALSE,
+            crate::structure::Bool::TRUE,
+        )) = self.x.st.bools.node(m)
+        {
             let val = if high { (k >> 32) as u32 } else { k as u32 };
             return Ok(self.s.m.i32(val));
         }
@@ -2981,17 +2986,14 @@ impl<'a> Lower<'a> {
             }
             Some(&Operand::Scalar { code, .. }) if code == NULL => Ok(self.s.m.bool(false)),
             Some(&Operand::Scalar { code, .. }) => {
-                if let Some(m) = inst
-                    .read(Reg::S(code))
-                    .and_then(|v| {
-                        self.x
-                            .st
-                            .masks
-                            .get(&v)
-                            .or_else(|| self.x.st.other.get(&v))
-                            .copied()
-                    })
-                {
+                if let Some(m) = inst.read(Reg::S(code)).and_then(|v| {
+                    self.x
+                        .st
+                        .masks
+                        .get(&v)
+                        .or_else(|| self.x.st.other.get(&v))
+                        .copied()
+                }) {
                     return self.boolean(m, at);
                 }
                 if !self.console_lanes {
@@ -4881,14 +4883,7 @@ impl<'a> Lower<'a> {
             };
             out.push(x);
         }
-        let one = match numeric {
-            Numeric::Uint | Numeric::Sint => 1,
-            _ => 1.0f32.to_bits(),
-        };
-        for k in out.len() as u32..channels {
-            out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
-        }
-        out.truncate(channels as usize);
+        out.resize(channels as usize, self.s.m.i32(0));
         Ok(out)
     }
 
@@ -5275,13 +5270,7 @@ impl<'a> Lower<'a> {
     /// shortcut: the console reads zeros (and drops writes) where `off` and
     /// the access pass the element's end; here they reach the next element,
     /// as the statically known strides' structured accesses may.
-    fn runtime_view(
-        &mut self,
-        src: &Source,
-        index: V,
-        off: V,
-        props: u32,
-    ) -> Result<(V, V), Why> {
+    fn runtime_view(&mut self, src: &Source, index: V, off: V, props: u32) -> Result<(V, V), Why> {
         let [raw, stride, bias] = self.stride_entry(src)?;
         let c = self.cur;
         let element = self.s.m.bin(c, Bin::Mul, index, stride);
@@ -5838,10 +5827,8 @@ impl<'a> Lower<'a> {
                     let s_hi = self.s.m.bin(c, Bin::AShr, lo, k31);
                     let fits = self.s.m.cmp(c, pred::EQ, hi, s_hi);
                     let pos = self.s.m.cmp(c, pred::SGE, hi, k0);
-                    let (imin, imax) = (
-                        self.s.m.i32(i32::MIN as u32),
-                        self.s.m.i32(i32::MAX as u32),
-                    );
+                    let (imin, imax) =
+                        (self.s.m.i32(i32::MIN as u32), self.s.m.i32(i32::MAX as u32));
                     let sat = self.s.m.select(c, pos, imax, imin);
                     self.s.m.select(c, fits, lo, sat)
                 } else {
@@ -5898,10 +5885,8 @@ impl<'a> Lower<'a> {
                     let flipped = self.s.m.cmp(c, pred::SLT, ps_xor, k0);
                     let ov = self.s.m.bin(c, Bin::And, same_sign, flipped);
                     let pos = self.s.m.cmp(c, pred::SGE, prod, k0);
-                    let (imin, imax) = (
-                        self.s.m.i32(i32::MIN as u32),
-                        self.s.m.i32(i32::MAX as u32),
-                    );
+                    let (imin, imax) =
+                        (self.s.m.i32(i32::MIN as u32), self.s.m.i32(i32::MAX as u32));
                     let sat = self.s.m.select(c, pos, imax, imin);
                     self.s.m.select(c, ov, sat, sum)
                 } else {
@@ -7800,8 +7785,12 @@ impl<'a> Lower<'a> {
         // Offset, bias, and comparison reference are always 32-bit dwords;
         // with a16, components from `whole` onward are packed in pairs, low half first.
         let whole = usize::from(name.ends_with("_o"))
-            + usize::from(name.starts_with("image_sample_b") || name.starts_with("image_gather4_b"))
-            + usize::from(name.starts_with("image_sample_c") || name.starts_with("image_gather4_c"));
+            + usize::from(
+                name.starts_with("image_sample_b") || name.starts_with("image_gather4_b"),
+            )
+            + usize::from(
+                name.starts_with("image_sample_c") || name.starts_with("image_gather4_c"),
+            );
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
             let (reg_idx, half) = if *a16 && k >= whole {
                 let p = k - whole;
@@ -8083,7 +8072,9 @@ impl<'a> Lower<'a> {
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
             let first = usize::from(offset_word)
-                + usize::from(name.starts_with("image_sample_b") || name.starts_with("image_gather4_b"))
+                + usize::from(
+                    name.starts_with("image_sample_b") || name.starts_with("image_gather4_b"),
+                )
                 + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
@@ -9651,7 +9642,9 @@ impl<'a> Lower<'a> {
                         self.s.m.undef(self.s.t.i32)
                     }
                     (Some(Val::Missing(why)), _)
-                        if is_direct || why.contains("scalar memory") || why.contains("s_memtime") =>
+                        if is_direct
+                            || why.contains("scalar memory")
+                            || why.contains("s_memtime") =>
                     {
                         return Err(Stop::Retry(phi.value, why));
                     }
@@ -9750,11 +9743,11 @@ mod tests {
             0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
             0x8500_80C1,    // s_cselect_b32 s0, -1, 0
             0xD501_0001,
-            0x0001_0080,    // v_cndmask_b32 v1, 0, 1, s0
+            0x0001_0080, // v_cndmask_b32 v1, 0, 1, s0
             0xD501_0002,
-            0x0201_02C1,    // v_cndmask_b32 v2, 1, v1, -1
+            0x0201_02C1, // v_cndmask_b32 v2, 1, v1, -1
             0xD834_0000,
-            0x0000_0200,    // ds_write_b32 v0, v2
+            0x0000_0200, // ds_write_b32 v0, v2
             S_ENDPGM,
         ];
         lowers(&words, 0x8001).unwrap();
@@ -9844,7 +9837,6 @@ mod tests {
         }
     }
 
-
     fn perm_features(selector: u32) -> u64 {
         // Synthetic compute shader:
         // v0 is the thread ID and can supply a dynamic selector.
@@ -9862,9 +9854,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -9881,13 +9871,14 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
-        let res = resource::track(
-            &p, &native.layout, native.stage
-        ).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
 
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
@@ -9903,13 +9894,12 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             options: super::TranslateOptions::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
