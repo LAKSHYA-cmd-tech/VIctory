@@ -384,7 +384,8 @@ mod tests {
         let (start, end) = (p, p + 4 * PAGE);
         {
             let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-            j.written.retain(|&k, _| k < p / PAGE || k >= (p + 4 * PAGE) / PAGE);
+            j.written
+                .retain(|&k, _| k < p / PAGE || k >= (p + 4 * PAGE) / PAGE);
         }
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
@@ -441,14 +442,29 @@ mod tests {
             let into = unsafe { std::slice::from_raw_parts_mut((view + 100) as *mut u8, 13) };
             file.read(into).is_ok_and(|n| n == 13)
         };
-        assert!(!read(&mut file), "the kernel does not fault into our handler");
+        assert!(
+            !read(&mut file),
+            "the kernel does not fault into our handler"
+        );
         writing(view + 100, 13);
         assert!(read(&mut file));
         // SAFETY: the bytes just read.
-        assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) }, b"from the disk");
-        assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 1).collect()));
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) },
+            b"from the disk"
+        );
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE..view / PAGE + 1).collect())
+        );
         // SAFETY: our view.
-        unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
         title_memory_remapped(view, 2 * BLOCK);
     }
 
@@ -508,7 +524,11 @@ mod tests {
         unsafe { ((b + 8) as *mut u8).write_volatile(7) };
         // SAFETY: the same byte through the other view.
         assert_eq!(unsafe { ((a + 8) as *const u8).read_volatile() }, 7);
-        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]), "written through the alias");
+        assert_eq!(
+            guard(a, a + BLOCK),
+            Some(vec![a / PAGE]),
+            "written through the alias"
+        );
         // And the other way round: a kernel write into `a` opens `b`.
         assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
         assert_eq!(guard(b, b + BLOCK), Some(vec![]));

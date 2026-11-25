@@ -473,7 +473,9 @@ fn psv_interps(
     pos += 4;
     if res_cnt > 0 {
         let res_sz = u32_at(d, pos).ok()? as usize;
-        pos = pos.checked_add(4)?.checked_add(res_cnt.checked_mul(res_sz)?)?;
+        pos = pos
+            .checked_add(4)?
+            .checked_add(res_cnt.checked_mul(res_sz)?)?;
     }
     let str_len = u32_at(d, pos).ok()? as usize;
     pos = pos.checked_add(4)?.checked_add(str_len)?;
@@ -772,8 +774,8 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
-            address_srvs: Vec::new(),
-            stride_table: false,
+                address_srvs: Vec::new(),
+                stride_table: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1059,7 +1061,9 @@ mod tests {
             }
         }
         for u in &cs.user_data {
-            if let crate::native::RootType::ResourceHeap | crate::native::RootType::SamplerHeap = u.root {
+            if let crate::native::RootType::ResourceHeap | crate::native::RootType::SamplerHeap =
+                u.root
+            {
                 ud[u.index as usize] = u32::MAX;
             }
         }
@@ -1076,11 +1080,9 @@ mod tests {
         raw_slot: u32,
         (first, count, stride): (u32, u32, u32),
     ) -> (super::host::View<'static>, super::StrideEntry) {
-        let window = super::RawWindow::covering(
-            u64::from(first * stride),
-            u64::from(count * stride),
-        )
-        .unwrap();
+        let window =
+            super::RawWindow::covering(u64::from(first * stride), u64::from(count * stride))
+                .unwrap();
         (
             super::host::View::RawAlias {
                 of,
@@ -1179,7 +1181,8 @@ mod tests {
             for slot in 0..2 {
                 let entry = match elements {
                     Some((first, count)) => {
-                        let (raw, entry) = raw_view_of(slot, 2 + slot as u32, (first, count, stride));
+                        let (raw, entry) =
+                            raw_view_of(slot, 2 + slot as u32, (first, count, stride));
                         views.push(raw);
                         entry
                     }
@@ -1518,7 +1521,8 @@ mod tests {
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
         let st = crate::structure::structure(&p).expect("structure");
-        let res = crate::resource::track(&p, &native.layout, native.stage).expect("resource::track");
+        let res =
+            crate::resource::track(&p, &native.layout, native.stage).expect("resource::track");
         let io = crate::io::raise(&p, &native).expect("io::raise");
         let l = super::lower::lower(&super::lower::Parts {
             native: &native,

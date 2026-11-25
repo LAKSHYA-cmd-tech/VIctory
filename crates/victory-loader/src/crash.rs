@@ -64,8 +64,11 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
-    let text = format!("{text}
-{}", title_output());
+    let text = format!(
+        "{text}
+{}",
+        title_output()
+    );
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -76,9 +79,16 @@ fn append_to_log(text: &str) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file);
     if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+        let _ = write!(
+            f,
+            "unix time {now}, process {}\n{text}\n",
+            std::process::id()
+        );
     }
 }
 
@@ -105,7 +115,9 @@ fn title_output() -> String {
     let Ok(said) = SAID.try_lock() else {
         return String::new();
     };
-    said.iter().map(|l| format!("  title said: {l}\n")).collect()
+    said.iter()
+        .map(|l| format!("  title said: {l}\n"))
+        .collect()
 }
 
 /// Installs the handlers; call once before running title code.
@@ -348,12 +360,20 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
         ((b(at + 3), b(at + 4)), at + 5)
     } else {
         // extrq reads its fields from src's low half, insertq from its high.
-        let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
+        let f = if prefix == 0x66 {
+            xmm[src].Low
+        } else {
+            xmm[src].High as u64
+        };
         ((f as u8, (f >> 8) as u8), at + 3)
     };
     let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
     let bits = if n == 0 { 64 } else { n };
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     if prefix == 0x66 {
         // extrq: register form takes its fields from src, works on dst.
         if immediate && (modrm >> 3) & 7 != 0 {
@@ -442,8 +462,7 @@ unsafe fn thrown(p: &[usize]) -> String {
         let types = p[3] + rva(p[2] + 12);
         let name = |i: usize| {
             let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
-            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
-                .to_string_lossy()
+            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char).to_string_lossy()
         };
         let first = name(0);
         let value = match &*first {
@@ -782,15 +801,9 @@ mod tests {
         assert_eq!(clwb_len(&[0x66, 0x41, 0x0f, 0xae, 0x31]), Some(5)); // clwb [r9]
         assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x30]), Some(4)); // clwb [rax]
         assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70, 0x40]), Some(5)); // clwb [rax+0x40]
-        assert_eq!(
-            clwb_len(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0]),
-            Some(8)
-        ); // [rax+disp32]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0]), Some(8)); // [rax+disp32]
         assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34, 0x24]), Some(5)); // clwb [rsp]
-        assert_eq!(
-            clwb_len(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0]),
-            Some(8)
-        ); // [rip+disp32]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0]), Some(8)); // [rip+disp32]
         assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x38]), None); // clflushopt, /7
         assert_eq!(clwb_len(&[0x0f, 0xae, 0x30]), None); // xsaveopt, no 66
         assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xf0]), None); // register form

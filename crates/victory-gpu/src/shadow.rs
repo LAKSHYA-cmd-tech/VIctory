@@ -224,7 +224,8 @@ impl Shadow {
             // ~650 pieces a frame).
             let end_of = |at: usize| (at + PIECE - (start + at) % PIECE).min(to);
             // SAFETY: inside the mapping; only the submitting thread writes it.
-            let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+            let host =
+                |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
             let differs = |a: usize, b: usize| host(a, b) != &before[a - from..b - from];
             let mut title = Vec::new();
             let mut synced = Vec::new();
@@ -665,7 +666,9 @@ pub(crate) fn find_wide(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let committed = committed_end(address, limit).max(hi);
         let backed = (committed - lo).next_multiple_of(TILE).min(limit - lo);
         let (buffer, backing, data) = host()?.sparse_buffer(2 * grain, lo - start, backed)?;
-        crate::host::name(&buffer, || format!("title memory {lo:#x}+{backed:#x} (sparse)"));
+        crate::host::name(&buffer, || {
+            format!("title memory {lo:#x}+{backed:#x} (sparse)")
+        });
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (lo - start);
         tracing::info!(
@@ -748,7 +751,11 @@ fn merge(title: &mut [u8], host: &mut [u8], old: &[u8], first: usize) -> Vec<(us
     while at < len {
         let end = if at == 0 { first } else { at + PIECE }.min(len);
         let mut changed = false;
-        for ((t, h), o) in title[at..end].iter_mut().zip(&mut host[at..end]).zip(&old[at..end]) {
+        for ((t, h), o) in title[at..end]
+            .iter_mut()
+            .zip(&mut host[at..end])
+            .zip(&old[at..end])
+        {
             if *h != *o && *t != *h {
                 *t = *h;
                 changed = true;

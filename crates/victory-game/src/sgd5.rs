@@ -65,7 +65,9 @@ fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     }
     Some(Record {
         offset: at,
-        name: (file.get(nul) == Some(&0)).then(|| name_before(file, nul)).flatten(),
+        name: (file.get(nul) == Some(&0))
+            .then(|| name_before(file, nul))
+            .flatten(),
         kind: *file.get(at.checked_sub(5)?)?,
         packed: file.get(start..end)?,
         unpacked_size,

@@ -96,7 +96,10 @@ impl Title {
                 .map(|(_, text)| text.as_str())
         };
         let id = get("Game/TitleId").and_then(|v| {
-            let v = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+            let v = v
+                .strip_prefix("0x")
+                .or_else(|| v.strip_prefix("0X"))
+                .unwrap_or(v);
             u32::from_str_radix(v, 16).ok()
         });
         let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());

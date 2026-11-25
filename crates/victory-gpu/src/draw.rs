@@ -1705,7 +1705,8 @@ fn describe(view: Option<&View>) -> String {
         ),
         // The first four values, as a colour rectangle's constants are.
         Some(View::Constant(address, size))
-            if *size >= 16 && let Some(w) = first_words(*address) =>
+            if *size >= 16
+                && let Some(w) = first_words(*address) =>
         {
             let v: [f32; 4] = std::array::from_fn(|i| {
                 f32::from_le_bytes(w[4 * i..4 * i + 4].try_into().unwrap_or_default())

@@ -117,7 +117,13 @@ pub(crate) fn host_shader(container: &[u8], stage: Option<HwStage>) -> Result<Ho
         .map_err(|e| e.to_string())
     };
     match CACHE.get() {
-        Some(cache) => cached(cache, &build_for(build(), stage), wave64, container, translate),
+        Some(cache) => cached(
+            cache,
+            &build_for(build(), stage),
+            wave64,
+            container,
+            translate,
+        ),
         None => translate(container),
     }
 }
