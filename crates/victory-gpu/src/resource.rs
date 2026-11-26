@@ -944,11 +944,19 @@ fn host_texture(
     // allows both; host D3D12 removes the device on invalid flag combinations, #735).
     // B5G5R5A1 (86) and B5G6R5 (85) have no typed UAV support; B4G4R4A4 (115)
     // has no render-target support; block-compressed formats have neither.
-    if matches!(d.format, 85 | 86) {
-        d.flags &= !UNORDERED;
-    }
-    if d.format == 115 {
+    // Xbox also permits 16-bit packed formats as render targets and UAVs simultaneously.
+    // B5G5R5A1 (86): typed UAV is unsupported on PC D3D12 — strip UNORDERED.
+    //   When the console requests UNORDERED alongside RENDER_TARGET (e.g. Bink2
+    //   video textures in Grand Theft Auto VI), strip RENDER_TARGET as well so
+    //   the texture is created cleanly as a shader resource.
+    // B4G4R4A4 (115): RTV is unsupported on PC D3D12 — strip RENDER_TARGET.
+    let strip_rtv = matches!(d.format, 86 | 115);
+    let strip_uav = matches!(d.format, 85 | 86);
+    if strip_rtv {
         d.flags &= !RENDER_TARGET;
+    }
+    if strip_uav {
+        d.flags &= !UNORDERED;
     }
     if element(d.format).is_some_and(|(_, w)| w > 1) {
         d.flags &= !(RENDER_TARGET | DEPTH | UNORDERED);
@@ -965,8 +973,10 @@ fn host_texture(
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). D3D12 rejects a non-null clear value if the
+    // resource does not have ALLOW_RENDER_TARGET or ALLOW_DEPTH_STENCIL, so
+    // null it out when RENDER_TARGET was stripped or when neither target flag is set.
+    let clear_value = (!clear.is_null() && (d.flags & (RENDER_TARGET | DEPTH) != 0)).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -2224,21 +2234,22 @@ mod tests {
         if crate::host::host().is_none() {
             return;
         }
-        // B5G5R5A1 with UAV
+        // B5G5R5A1 with both RTV and UAV and a clear value (GTA VI Bink2 video textures)
         let b5g5r5a1 = texture(64, 64, 86, 1);
         let mut desc = b5g5r5a1;
-        desc.flags = 4; // UNORDERED
-        let res = host_texture(&desc, 0, std::ptr::null());
+        desc.flags = 1 | 4; // RENDER_TARGET | UNORDERED
+        let clear_val = [86u32, 0, 0, 0, 0];
+        let res = host_texture(&desc, 0, clear_val.as_ptr().cast());
         assert!(
             res.is_some(),
-            "B5G5R5A1 texture creation succeeded without UAV"
+            "B5G5R5A1 texture creation succeeded with stripped RTV/UAV and clear value"
         );
 
-        // B4G4R4A4 with RenderTarget
+        // B4G4R4A4 with RenderTarget and clear value
         let b4g4r4a4 = texture(64, 64, 115, 1);
         let mut desc2 = b4g4r4a4;
         desc2.flags = 1; // RENDER_TARGET
-        let res2 = host_texture(&desc2, 0, std::ptr::null());
+        let res2 = host_texture(&desc2, 0, clear_val.as_ptr().cast());
         assert!(
             res2.is_some(),
             "B4G4R4A4 texture creation succeeded without RenderTarget"
