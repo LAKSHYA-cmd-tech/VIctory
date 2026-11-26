@@ -103,6 +103,8 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod cube_resinfo_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -113,6 +115,8 @@ mod sampler;
 #[cfg(all(test, windows))]
 mod sampler_tests;
 mod shader;
+#[cfg(test)]
+mod typed_store_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
