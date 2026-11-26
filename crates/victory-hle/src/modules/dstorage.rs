@@ -117,15 +117,19 @@ type Factory = *const Object;
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const FILE_SHARE_DELETE: u32 = 4;
     const OPEN_EXISTING: u32 = 3;
     if path.is_null() {
         return E_INVALIDARG;
     }
-    // Goes through `files`, so paths on our virtual drives work too.
+    // Goes through `files`, so paths on our virtual drives work too. The
+    // title's own tools and mods hold its files open for writing; a read
+    // that shares only reads fails them.
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         std::ptr::null(),
         OPEN_EXISTING,
         0,
@@ -1286,6 +1290,44 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+    }
+
+    /// A file another writer holds open (sharing reads and writes, not
+    /// deletes) still opens: the title's own tools keep its files open.
+    #[test]
+    fn open_file_shares_writes_and_deletes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"data").unwrap();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, no FILE_SHARE_DELETE.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x3)
+            .open(&path)
+            .unwrap();
+        let file = open(&path);
+        void(file, 0x10);
+        drop(held);
+    }
+
+    /// A missing path fails with the host's own error code, captured before
+    /// anything allocates.
+    #[test]
+    fn open_file_reports_the_os_error() {
+        use std::os::windows::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.bin");
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x20);
+        let mut file = std::ptr::null_mut();
+        // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND).
+        assert_eq!(
+            open(factory(), wide.as_ptr(), std::ptr::null(), &mut file),
+            0x8007_0002_u32 as i32
+        );
     }
 
     #[test]

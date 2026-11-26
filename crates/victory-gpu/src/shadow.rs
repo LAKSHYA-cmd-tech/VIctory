@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -43,6 +43,11 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// The title released the buffer (crate::shadow::unregister) while
+    /// this copy still had a submission's copy-back pending: writing through
+    /// data would land in whatever took the addresses, so nothing is
+    /// written back (FIND-14).
+    gone: AtomicBool,
     /// What keeps the mapping alive when `buffer` is a sparse one.
     pub(crate) _backing: Option<ID3D12Resource>,
 }
@@ -126,6 +131,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            gone: AtomicBool::new(false),
             _backing: None,
         }
     }
@@ -207,6 +213,12 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        // The title took the buffer back while this copy-back was pending: the
+        // addresses belong to whatever holds them now, so nothing goes back
+        // (FIND-14). The copy stays for the lists that still hold it.
+        if self.gone.load(Ordering::Relaxed) {
+            return 0;
+        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -460,7 +472,13 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    if let Some(entry) = buffers().remove(&(start, resource)) {
+        // A copy-back still pending must not write through an address the
+        // title has taken back: whatever holds it now is not this copy's.
+        if let Some(shadow) = entry.shadow {
+            shadow.gone.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -1042,5 +1060,71 @@ mod warp_tests {
         assert_eq!(after[48], 9, "the title's own write");
         assert!(after[..48].iter().chain(&after[216..]).all(|&b| b == 1));
         drop(memory);
+    }
+
+    /// FIND-14: a copy-back that is still pending when the title gives its
+    /// range back - and takes the same addresses again for something else -
+    /// must not put the submission's bytes into the new use of them.
+    #[test]
+    fn a_pending_copy_back_does_not_write_into_memory_the_title_took_back() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let len = PAGE;
+        // SAFETY: allocating one page of read-write memory for the test.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert!(p != 0);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            // SAFETY: releasing the memory allocated above.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        // The submission takes its snapshot, and a shader writes one byte.
+        copy.writing(p, 64);
+        // SAFETY: inside the copy's mapping.
+        unsafe { copy.data.add(24).write(0x99) };
+        // The title gives the range back before the copy-back has run...
+        unregister(p, p as u64);
+        // SAFETY: our own allocation, freed once.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // ...and takes the addresses again for something of its own.
+        // SAFETY: a fresh allocation of the same size, filled for the test.
+        let q = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert!(q != 0);
+        // SAFETY: the allocation above.
+        unsafe { std::ptr::write_bytes(q as *mut u8, 0xee, len) };
+        if q != p {
+            // The allocator handed out somewhere else.
+            // SAFETY: as above.
+            unsafe { VirtualFree(q as *mut _, 0, MEM_RELEASE) };
+            return;
+        }
+        // The copy-back of the submission that is over runs now.
+        assert_eq!(copy.copy_back(p, 64), 0);
+        // SAFETY: the re-used allocation, still mapped.
+        let after = unsafe { (q as *const u8).add(24).read_volatile() };
+        // SAFETY: as above.
+        unsafe { VirtualFree(q as *mut _, 0, MEM_RELEASE) };
+        assert_eq!(
+            after, 0xee,
+            "a byte a shader wrote for a submission that is over landed in memory the title re-used"
+        );
     }
 }
