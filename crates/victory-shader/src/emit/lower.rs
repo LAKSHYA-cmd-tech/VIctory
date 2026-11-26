@@ -8093,7 +8093,11 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                let x = if kind == 5 && ch == 2 {
+                    // GCN3 §12.16 / RDNA3 §10.1 / LLPC / RADV / gfx1031:
+                    // cubemap resinfo reports face count (6), not 1.
+                    self.s.m.i32(6)
+                } else if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
                     self.s.m.extract(c, d, ch)
@@ -8745,7 +8749,7 @@ impl<'a> Lower<'a> {
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
-                if count != 4 || *offen || *offset != 0 {
+                if count != 4 || *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
