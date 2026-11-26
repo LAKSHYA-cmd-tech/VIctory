@@ -1087,6 +1087,13 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            // DXIL does not allow WaveSize on mesh shaders (only compute and
+            // node shaders); the validator would reject the DXIL. Mesh shaders
+            // therefore always run on the host's native wave width. The
+            // translator already refuses mesh shaders that use cross-lane ops
+            // ("a cross-lane operation in a mesh shader"), so a successfully
+            // translated wave64 mesh shader has no cross-lane ops and can
+            // execute correctly in wave32 mode.
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
