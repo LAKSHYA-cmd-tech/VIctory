@@ -743,6 +743,9 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    /// Last eligible color target nominated during recording of this list.
+    #[cfg(feature = "diagnostics")]
+    present_1440p: Mutex<Option<crate::capture::PresentCandidate>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -826,9 +829,7 @@ impl<R> BufferStates<R> {
 /// builds).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
-    })
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
 
 /// Whether each list of a submission runs and is timed on its own, slow
@@ -837,7 +838,7 @@ pub(crate) fn dred_on() -> bool {
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1138,6 +1139,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                present_1440p: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -1195,6 +1198,16 @@ impl Host {
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if crate::capture::present_1440p_on()
+                // SAFETY: a live fence of this queue.
+                && unsafe { self.fence.GetCompletedValue() } >= *submitted
+                && let Some(copy) = runs.iter().rev().find_map(|list| {
+                    list.present_1440p.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                })
+            {
+                crate::capture::publish_1440p_target(copy);
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
@@ -1607,6 +1620,8 @@ impl HostList {
             .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        drop(self.present_1440p.lock().unwrap_or_else(|e| e.into_inner()).take());
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1623,6 +1638,30 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_1440p_target(&self, resource: crate::object::This) {
+        if !crate::capture::present_1440p_on() {
+            return;
+        }
+        let Some(copy) = crate::resource::host_copy(resource) else {
+            return;
+        };
+        // SAFETY: a live host texture.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && desc.Width == 2560
+            && desc.Height == 1440
+            && desc.DepthOrArraySize == 1
+            && desc.MipLevels == 1
+            && desc.SampleDesc.Count == 1
+            && matches!(desc.Format.0, 28 | 29 | 87 | 91)
+            && desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
+        {
+            *self.present_1440p.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(crate::capture::PresentCandidate { resource: resource as usize, copy });
         }
     }
 
