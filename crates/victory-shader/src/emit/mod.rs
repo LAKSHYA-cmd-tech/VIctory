@@ -111,6 +111,8 @@ pub mod host;
 mod lower;
 #[cfg(test)]
 mod mtbuf_tests;
+#[cfg(test)]
+mod packed_mod_tests;
 mod sampler;
 #[cfg(all(test, windows))]
 mod sampler_tests;
