@@ -613,17 +613,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(
-            tiled.len(),
-            mip,
-            slice,
-            linear.len(),
-            row_pitch,
-            depth_pitch,
-            |t, l, len| {
-                linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-            },
-        )
+        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch)
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -636,30 +626,19 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(
-            tiled.len(),
-            mip,
-            slice,
-            linear.len(),
-            row_pitch,
-            depth_pitch,
-            |t, l, len| {
-                tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
-            },
-        )
+        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch)
     }
 
-    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
+    /// Copies contiguous runs in one direction between the two layouts.
     #[allow(clippy::too_many_arguments)]
-    fn walk(
+    fn walk<const DETILE: bool>(
         &self,
-        tiled_len: usize,
+        src: &[u8],
+        dst: &mut [u8],
         mip: u32,
         slice: u32,
-        linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
-        mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
@@ -685,6 +664,11 @@ impl Layout {
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
+        let (tiled_len, linear_len) = if DETILE {
+            (src.len(), dst.len())
+        } else {
+            (dst.len(), src.len())
+        };
         if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
@@ -706,6 +690,13 @@ impl Layout {
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
         }
+        // A mip can end partway through the last run. Check the other runs
+        // once so each row can copy them as fixed-size chunks.
+        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+        let chunk_size = body.first().map(|run| run.2).filter(|&size| {
+            body.iter()
+                .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
+        });
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -713,16 +704,67 @@ impl Layout {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy(tiled_row as usize, linear_row, bytes);
+                    copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
                 } else {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    for &(tiled, linear, len) in &runs {
-                        copy(tiled_row + tiled, linear_row + linear, len);
+                    match chunk_size {
+                        Some(8) if tiled_row.is_multiple_of(8) => {
+                            copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
+                        }
+                        Some(16) if tiled_row.is_multiple_of(16) => {
+                            copy_runs::<16, DETILE>(src, dst, body, tiled_row, linear_row)
+                        }
+                        Some(32) if tiled_row.is_multiple_of(32) => {
+                            copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
+                        }
+                        _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
                     }
+                    copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
                 }
             }
         }
         Ok(())
+    }
+}
+
+fn copy_run<const DETILE: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    tiled: usize,
+    linear: usize,
+    len: usize,
+) {
+    let (from, to) = if DETILE {
+        (tiled, linear)
+    } else {
+        (linear, tiled)
+    };
+    dst[to..][..len].copy_from_slice(&src[from..][..len]);
+}
+
+fn copy_runs<const N: usize, const DETILE: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    runs: &[(usize, usize, usize)],
+    tiled_row: usize,
+    linear_row: usize,
+) {
+    if N == 0 {
+        for &(tiled, linear, len) in runs {
+            copy_run::<DETILE>(src, dst, tiled_row + tiled, linear_row + linear, len);
+        }
+    } else if DETILE {
+        let tiled = src.as_chunks::<N>().0;
+        let linear = dst[linear_row..][..runs.len() * N].as_chunks_mut::<N>().0;
+        for (out, &(offset, ..)) in linear.iter_mut().zip(runs) {
+            *out = tiled[(tiled_row + offset) / N];
+        }
+    } else {
+        let tiled = dst.as_chunks_mut::<N>().0;
+        let linear = src[linear_row..][..runs.len() * N].as_chunks::<N>().0;
+        for (input, &(offset, ..)) in linear.iter().zip(runs) {
+            tiled[(tiled_row + offset) / N] = *input;
+        }
     }
 }
 
