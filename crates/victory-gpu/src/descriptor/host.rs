@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 use victory_shader::emit::{RawWindow, StrideEntry};
@@ -14,6 +15,66 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+
+/// The title's slots past a host heap that could not hold them (the NVIDIA
+/// cap): how many times a slot was skipped, the highest index among them,
+/// and the size of the heap they were past.
+pub(crate) static PAST_HEAP: PastHeap = PastHeap::new();
+
+/// How many times a title slot past the host heap was skipped, the highest
+/// index among them, and the size of the heap. The highest index is what
+/// says how far past the heap the title went, and the count of the slots
+/// past the heap is what a run's statistics name: a warning per slot past
+/// the heap floods the log (310 720 lines in one world load).
+pub(crate) struct PastHeap {
+    skips: std::sync::atomic::AtomicU64,
+    highest: std::sync::atomic::AtomicU32,
+    count: std::sync::atomic::AtomicU32,
+}
+
+impl PastHeap {
+    const fn new() -> Self {
+        Self {
+            skips: std::sync::atomic::AtomicU64::new(0),
+            highest: std::sync::atomic::AtomicU32::new(0),
+            count: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Counts a title slot past a heap of `count` slots: the skips so far,
+    /// the highest index seen, and the heap's size.
+    fn note(&self, index: u32, count: u32) -> (u64, u32, u32) {
+        let skips = self.skips.fetch_add(1, Ordering::Relaxed) + 1;
+        let highest = self.highest.fetch_max(index, Ordering::Relaxed).max(index);
+        self.count.store(count, Ordering::Relaxed);
+        (skips, highest, count)
+    }
+
+    /// The skips so far, the highest index seen, and the heap's size.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) fn get(&self) -> (u64, u32, u32) {
+        (
+            self.skips.load(Ordering::Relaxed),
+            self.highest.load(Ordering::Relaxed),
+            self.count.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// How many of the title's slots are past a heap of `count` slots, when the
+/// title's slots reach `highest`: they are numbered from zero, so the ones
+/// past the heap are those from `count` to `highest`.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn slots_past(count: u32, highest: u32) -> u32 {
+    highest.saturating_sub(count.saturating_sub(1))
+}
+
+/// Whether the `count`th skipped slot is worth a warning: the first one, and
+/// then every doubling, so the log shows how far past the heap the title went
+/// without a line per slot.
+fn worth_a_warning(count: u64) -> bool {
+    count == 1 || count.is_power_of_two()
+}
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -620,12 +681,15 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            // Diagnostic (NVIDIA heap cap): the title's slots past the host
+            // heap. The count of them is in the run's statistics; a warning
+            // per slot floods the log.
+            let (skips, highest, _) = PAST_HEAP.note(index, self.count);
+            if worth_a_warning(skips) {
                 tracing::warn!(
+                    skips,
                     index,
+                    highest,
                     count = self.count,
                     for_draw,
                     "title slot past the host heap"
@@ -1867,6 +1931,34 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's slots past a capped host heap are counted, and the log
+    /// names the first of them and every doubling after it: a warning per
+    /// skip floods the log (310 720 lines in one world load).
+    #[test]
+    fn the_slots_past_a_capped_heap_are_counted_and_the_log_names_a_few() {
+        let past = PastHeap::new();
+        assert_eq!(past.get(), (0, 0, 0));
+        assert_eq!(past.note(1_245_183, 934_464), (1, 1_245_183, 934_464));
+        assert_eq!(past.note(934_464, 934_464), (2, 1_245_183, 934_464));
+        assert_eq!(past.get(), (2, 1_245_183, 934_464));
+        // The warnings: the first skip and then every doubling.
+        assert!(worth_a_warning(1));
+        assert!(worth_a_warning(2));
+        assert!(!worth_a_warning(3));
+        assert!(worth_a_warning(4));
+        assert!(!worth_a_warning(5));
+        assert!(worth_a_warning(1 << 20));
+        assert!(!worth_a_warning((1 << 20) + 1));
+        // A run with 2 097 152 skips names 22 of them.
+        let named = (1..=2_097_152).filter(|n| worth_a_warning(*n)).count();
+        assert_eq!(named, 22);
+        // The title's slots are numbered from zero: the ones past the heap
+        // are those from the heap's last slot to the highest index seen.
+        assert_eq!(slots_past(934_464, 1_245_183), 310_720);
+        assert_eq!(slots_past(934_464, 934_463), 0);
+        assert_eq!(slots_past(934_464, 934_464), 1);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
