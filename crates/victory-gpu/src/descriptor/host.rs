@@ -107,6 +107,14 @@ pub(crate) struct HostHeap {
     /// heaps), and which slots have a raw view there.
     alias_base: u32,
     aliases: Mutex<Aliases>,
+    range_id: u64,
+}
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        let mut ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        unregister_gpu_range(&mut ranges, self.range_id);
+    }
 }
 
 /// The raw views of the bytes structured and typed buffer views read, for
@@ -188,16 +196,51 @@ impl StrideTable {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuRange {
+    id: u64,
+    start: u64,
+    bytes: u64,
+    step: u64,
+    sampler: bool,
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
-static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
+static GPU_RANGES: Mutex<Vec<GpuRange>> = Mutex::new(Vec::new());
+static NEXT_RANGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// For device-removed reports: where host GPU address `va` lies against
-/// the host descriptor heaps.
-pub(crate) fn near_heaps(va: u64) -> String {
-    let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+fn register_gpu_range(
+    ranges: &mut Vec<GpuRange>,
+    id: u64,
+    start: u64,
+    bytes: u64,
+    step: u64,
+    sampler: bool,
+) {
+    ranges.push(GpuRange {
+        id,
+        start,
+        bytes,
+        step,
+        sampler,
+    });
+}
+
+fn unregister_gpu_range(ranges: &mut Vec<GpuRange>, id: u64) {
+    ranges.retain(|range| range.id != id);
+}
+
+fn near_heaps_in(ranges: &[GpuRange], va: u64) -> String {
     let mut text = String::new();
-    for &(start, bytes, step, sampler) in ranges.iter() {
+    for &GpuRange {
+        start,
+        bytes,
+        step,
+        sampler,
+        ..
+    } in ranges
+    {
         let kind = if sampler { "sampler" } else { "view" };
         let place = if va < start {
             format!("{:#x} below", start - va)
@@ -213,6 +256,13 @@ pub(crate) fn near_heaps(va: u64) -> String {
         text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
     }
     text
+}
+
+/// For device-removed reports: where host GPU address `va` lies against
+/// the host descriptor heaps.
+pub(crate) fn near_heaps(va: u64) -> String {
+    let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    near_heaps_in(&ranges, va)
 }
 
 /// The host's limit for shader-visible view heaps on resource binding
@@ -304,12 +354,15 @@ impl HostHeap {
         tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
-        GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
+        let range_id = NEXT_RANGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        register_gpu_range(
+            &mut GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()),
+            range_id,
             gpu,
             u64::from(count + extra + aliases + guard) * u64::from(step),
             u64::from(step),
             sampler,
-        ));
+        );
         let strides = if sampler {
             None
         } else {
@@ -333,6 +386,7 @@ impl HostHeap {
                 free: Vec::new(),
                 next: NULL_ALIASES,
             }),
+            range_id,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2793,5 +2847,43 @@ mod tests {
         assert_eq!(unsafe { *buf_ptr.cast::<u32>() }, 0x1234_ABCD);
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(slot::<Release>(buf_obj, 0x10)(buf_obj), 0);
+    }
+
+    #[test]
+    fn gpu_ranges_unregister_removes_only_matching_heap() {
+        let mut ranges = Vec::new();
+        register_gpu_range(&mut ranges, 1, 0x1000, 0x400, 32, false);
+        register_gpu_range(&mut ranges, 2, 0x1000, 0x400, 32, false);
+        register_gpu_range(&mut ranges, 3, 0x2000, 0x200, 16, true);
+
+        unregister_gpu_range(&mut ranges, 1);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].id, 2);
+        assert_eq!(ranges[1].id, 3);
+
+        unregister_gpu_range(&mut ranges, 2);
+        assert_eq!(
+            near_heaps_in(&ranges, 0x2040),
+            "; sampler heap 0x2000+0x200: inside, slot 4"
+        );
+    }
+
+    #[test]
+    fn near_heaps_formats_below_inside_and_past_end() {
+        let mut ranges = Vec::new();
+        register_gpu_range(&mut ranges, 1, 0x1000, 0x100, 32, false);
+
+        assert_eq!(
+            near_heaps_in(&ranges, 0x0f80),
+            "; view heap 0x1000+0x100: 0x80 below"
+        );
+        assert_eq!(
+            near_heaps_in(&ranges, 0x1040),
+            "; view heap 0x1000+0x100: inside, slot 2"
+        );
+        assert_eq!(
+            near_heaps_in(&ranges, 0x1140),
+            "; view heap 0x1000+0x100: 0x40 past its end (slot 10)"
+        );
     }
 }
