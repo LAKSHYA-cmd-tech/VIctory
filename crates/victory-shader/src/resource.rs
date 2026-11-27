@@ -366,6 +366,12 @@ impl<'a> Tracer<'a> {
     /// Layout index and dword of the root parameter `reg` holds on entry.
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
+        // Compute has at most 16 user SGPRs (`s0..s15`); `user_data >= 16`
+        // spills to the root signature's memory, while `s16+` hold system
+        // inputs (thread-group id, group info).
+        if self.stage == HwStage::Cs && code >= 16 {
+            return None;
+        }
         self.layout.iter().enumerate().find_map(|(i, p)| {
             let first = self.stage.user_sgpr(p.user_data);
             let dword = u32::from(code).checked_sub(first.into())?;
@@ -1512,5 +1518,32 @@ mod tests {
                 "{hi:#x}"
             );
         }
+    }
+
+    /// Compute shaders only receive user data in `s0..s15`; spilled parameters
+    /// (`user_data >= 16`) or parameters spanning into `s16+` must not claim
+    /// `s16+` in compute stage, because `s16+` hold system inputs (`SV_GroupID`,
+    /// `GroupInfo`).
+    #[test]
+    fn compute_stage_never_claims_system_sgprs_in_param_of() {
+        let words: &[u32] = &[
+            0xBE82_0310, // s_mov_b32 s2, s16
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let s16_in = p.inputs.iter().find(|i| i.0 == Reg::S(16)).unwrap().1;
+        // In compute (Cs), a layout parameter covering s14..s17 must NOT claim s16:
+        let r_cs = track(&p, &[param(Table, 14, 4)], HwStage::Cs).unwrap();
+        assert!(
+            !r_cs.params.iter().any(|&(v, _, _)| v == s16_in),
+            "compute system SGPR s16 must not be claimed by user parameter"
+        );
+        // In pixel (Ps), s16 is a valid user SGPR:
+        let r_ps = track(&p, &[param(Table, 14, 4)], HwStage::Ps).unwrap();
+        assert!(
+            r_ps.params.iter().any(|&(v, _, _)| v == s16_in),
+            "pixel stage can legitimately claim s16 as user SGPR"
+        );
     }
 }
