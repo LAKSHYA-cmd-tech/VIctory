@@ -2507,6 +2507,16 @@ impl Meter {
                     );
                 }
             }
+            // The title's slots the host heap could not hold (the NVIDIA
+            // cap): a shader that indexes one reads past the heap.
+            let (skips, highest, count) = crate::descriptor::host::PAST_HEAP.get();
+            if highest >= count && count > 0 {
+                tracing::info!(
+                    "title slots past the host heap: {} (the title's slots reach {highest}, \
+                     the heap holds {count}; {skips} skips)",
+                    crate::descriptor::host::slots_past(count, highest)
+                );
+            }
         }
         if self.caption.is_none() {
             // The window's own text, read without a message.

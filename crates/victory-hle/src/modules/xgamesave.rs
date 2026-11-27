@@ -211,6 +211,14 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
     let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
     let blobs = names.split_off(2);
+    for i in 0..blobs.len() {
+        match std::fs::metadata(version.join(i.to_string())) {
+            Ok(info) if info.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
     let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
     Ok(Some(Version {
         dir: version,
@@ -485,7 +493,9 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.number + 1);
+        let Some(number) = current.as_ref().map_or(Some(1), |v| v.number.checked_add(1)) else {
+            return NO_ACCESS;
+        };
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
