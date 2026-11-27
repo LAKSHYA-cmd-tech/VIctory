@@ -390,6 +390,10 @@ impl Shader {
     /// The handle of immediate sampler `n` (a comparison sampler when
     /// `comparison` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32, comparison: bool) -> V {
+        let n = match self.samplers.len().checked_sub(1) {
+            Some(last) => n.min(last as u32),
+            None => n,
+        };
         let bind = [
             self.m.i32(n),
             self.m.i32(n),

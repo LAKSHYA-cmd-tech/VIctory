@@ -754,6 +754,25 @@ mod tests {
     }
 
     #[test]
+    fn sampler_handle_clamps_out_of_range_indices() {
+        let mut clamped = Shader::new(false);
+        clamped.samplers = vec![false, false];
+        let b = clamped.entry;
+        let _ = clamped.sampler_handle(b, 5, false);
+        clamped.m.terminate(b, super::bitcode::Term::Ret);
+        let clamped_dxil = clamped.finish();
+
+        let mut in_range = Shader::new(false);
+        in_range.samplers = vec![false, false];
+        let b = in_range.entry;
+        let _ = in_range.sampler_handle(b, 1, false);
+        in_range.m.terminate(b, super::bitcode::Term::Ret);
+        let in_range_dxil = in_range.finish();
+
+        assert_eq!(clamped_dxil, in_range_dxil);
+    }
+
+    #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
         let Ok(host) = super::host::Host::new(false) else {

@@ -613,7 +613,12 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
-            for (n, s) in t.static_samplers.iter().enumerate() {
+            for (n, s) in t
+                .static_samplers
+                .iter()
+                .take(2048)
+                .enumerate()
+            {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
@@ -1270,5 +1275,15 @@ mod tests {
         let mut unclamped = clamped[0];
         unclamped.MipLODBias = raw_samplers[0].mip_lod_bias;
         assert!(root_signature(&host.device, &[], &[unclamped], true).is_err());
+    }
+
+    #[test]
+    fn static_samplers_take_at_most_2048() {
+        use victory_shader::emit::StaticSampler;
+
+        let dummy = StaticSampler::from_words([0; 4]);
+        let samplers = vec![dummy; 2050];
+        let capped: Vec<_> = samplers.iter().take(2048).collect();
+        assert_eq!(capped.len(), 2048);
     }
 }
