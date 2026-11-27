@@ -277,6 +277,7 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         tracing::info!("host D3D12 device ready");
+        view_limit(&device);
         let wave64_mode = recommended_wave64_mode(&device);
         crate::shader_cache::set_wave64_mode(wave64_mode);
         tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
@@ -295,6 +296,38 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// Clamps translated shaders' view-heap indices below what `device` takes
+/// (`victory_shader::emit::heap_views`), before any translation: a host
+/// that refuses a shader-visible heap of `HEAP_VIEWS` (NVIDIA caps them at
+/// 10^6 slots) gets the portable limit, which every host takes. A clamp
+/// past the heap faulted the device there (#3330).
+fn view_limit(device: &ID3D12Device) {
+    use victory_shader::emit::{HEAP_VIEWS, PORTABLE_HEAP_VIEWS, set_heap_views};
+    // SAFETY: plain heap creation with a valid description; dropped at once.
+    let full = unsafe {
+        device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: HEAP_VIEWS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+    };
+    let views = match full {
+        Ok(_) => HEAP_VIEWS,
+        Err(e) => {
+            tracing::info!(error = %e, "host view heaps capped at {PORTABLE_HEAP_VIEWS}: shaders index below it");
+            PORTABLE_HEAP_VIEWS
+        }
+    };
+    if !set_heap_views(views) && victory_shader::emit::heap_views() != views {
+        tracing::warn!(
+            views,
+            set = victory_shader::emit::heap_views(),
+            "view-heap limit read before the host device: shaders may index past its heaps"
+        );
     }
 }
 

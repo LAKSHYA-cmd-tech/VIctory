@@ -76,8 +76,10 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
+        let _ = crate::host::host();
         let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
+        let views = victory_shader::emit::heap_views();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
                 limit,
@@ -87,6 +89,7 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.extend_from_slice(&views.to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -107,6 +110,7 @@ fn build() -> &'static [u8; 32] {
 /// with `stage` the program of that hardware stage (the ES or GS half of a
 /// geometry pipeline).
 pub(crate) fn host_shader(container: &[u8], stage: Option<HwStage>) -> Result<HostShader, String> {
+    let _ = crate::host::host();
     let wave64 = effective_wave64_mode();
     let options = TranslateOptions { wave64 };
     let translate = |c: &[u8]| {
