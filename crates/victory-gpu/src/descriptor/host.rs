@@ -267,7 +267,8 @@ pub(crate) fn near_heaps(va: u64) -> String {
 
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
+#[cfg(test)]
+const PORTABLE_VIEWS: u32 = victory_shader::emit::PORTABLE_HEAP_VIEWS;
 
 /// The maximum shader-visible sampler count on D3D12 (all tiers).
 const PORTABLE_SAMPLERS: u32 = 2048;
@@ -307,6 +308,7 @@ impl HostHeap {
         let guard = if sampler { 0 } else { 1 };
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
+        let views = victory_shader::emit::heap_views();
         let (heap, count, extra) = if sampler {
             let requested = count;
             let target_count = if count > PORTABLE_SAMPLERS {
@@ -322,22 +324,22 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if count + DYNAMIC + aliases + guard <= PORTABLE_VIEWS
+        } else if count + DYNAMIC + aliases + guard <= views
             && let Ok(heap) = make(count + DYNAMIC + aliases + guard)
         {
             (heap, count, DYNAMIC)
-        } else if count + MIN_DYNAMIC + aliases + guard <= PORTABLE_VIEWS
+        } else if count + MIN_DYNAMIC + aliases + guard <= views
             && let Ok(heap) = make(count + MIN_DYNAMIC + aliases + guard)
         {
             (heap, count, MIN_DYNAMIC)
         } else {
             // shortcut: descriptors past the host's limit are left
             // out; a title that reaches them needs remapping.
-            tracing::warn!(count, "host view heap capped at {PORTABLE_VIEWS}");
-            let (heap, total) = [PORTABLE_VIEWS, 500_000, 250_000, MIN_DYNAMIC]
+            tracing::warn!(count, "host view heap capped at {views}");
+            let (heap, total) = [views, 500_000, 250_000, MIN_DYNAMIC]
                 .into_iter()
                 .find_map(|cap| make(cap).ok().map(|h| (h, cap)))?;
-            let extra = if total >= PORTABLE_VIEWS {
+            let extra = if total >= views {
                 (1 << 17).min(total / 4)
             } else {
                 MIN_DYNAMIC.min(total / 2)

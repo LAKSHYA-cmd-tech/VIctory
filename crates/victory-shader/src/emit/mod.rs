@@ -133,8 +133,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    ROOT_ADDRESS_SPACE, ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry,
-    USER_DATA_SPACE,
+    HEAP_SAMPLERS, HEAP_VIEWS, PORTABLE_HEAP_VIEWS, ROOT_ADDRESS_SPACE, ROOT_CBV_SPACE, RawWindow,
+    SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE, heap_views, null_buffer_view,
+    set_heap_views,
 };
 
 /// The loop limit without an override: 2^20.
@@ -770,6 +771,25 @@ mod tests {
         let in_range_dxil = in_range.finish();
 
         assert_eq!(clamped_dxil, in_range_dxil);
+    }
+
+    #[test]
+    fn heap_handle_clamps_out_of_range_indices() {
+        let mut s = Shader::new(false);
+        let b = s.entry;
+        let index = s.m.i32(2_000_000);
+        let _ = s.heap_handle(b, index, false, (0, 0));
+        let sampler_index = s.m.i32(5000);
+        let _ = s.heap_handle(b, sampler_index, true, (0, 0));
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        let dxil = s.finish();
+        assert!(!dxil.is_empty());
+    }
+
+    #[test]
+    fn heap_views_defaults_or_clamps() {
+        assert!(heap_views() >= 4);
+        assert_eq!(null_buffer_view(), heap_views() - 2);
     }
 
     #[test]

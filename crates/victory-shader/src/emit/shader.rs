@@ -19,6 +19,38 @@ pub const ROOT_ADDRESS_SPACE: u32 = 2;
 /// (one [`StrideEntry`] per view-heap slot).
 pub const STRIDE_SPACE: u32 = 3;
 
+/// The most view-heap slots a translated shader can index: its indices are
+/// clamped below [`heap_views`], at most this.
+pub const HEAP_VIEWS: u32 = 1 << 21;
+/// Sampler-heap indices are clamped below this: the host's sampler heaps
+/// are at least this large.
+pub const HEAP_SAMPLERS: u32 = 2048;
+/// The shader-visible view heap size every host takes (resource binding
+/// tiers 1 and 2; NVIDIA's tier 3 hardware takes no more), the view limit
+/// on a host that refuses a heap of [`HEAP_VIEWS`].
+pub const PORTABLE_HEAP_VIEWS: u32 = 1_000_000;
+
+static VIEW_LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// View-heap indices are clamped below this: the host's view heaps are at
+/// least this large. [`HEAP_VIEWS`] unless [`set_heap_views`] chose less (a host
+/// whose heaps are capped, NVIDIA). The value is part of the translation, so the
+/// shader cache must key on it.
+pub fn heap_views() -> u32 {
+    *VIEW_LIMIT.get_or_init(|| HEAP_VIEWS)
+}
+
+/// Sets [`heap_views`] (between 4 and [`HEAP_VIEWS`]), before the first
+/// translation; false once it was read or set (the value then stays).
+pub fn set_heap_views(views: u32) -> bool {
+    VIEW_LIMIT.set(views.clamp(4, HEAP_VIEWS)).is_ok()
+}
+
+/// The null buffer view index, two below [`heap_views`].
+pub fn null_buffer_view() -> u32 {
+    heap_views() - 2
+}
+
 /// What the host writes per view-heap slot in the runtime stride table, for
 /// buffers a shader reads without a stride known when it was translated.
 ///
@@ -436,6 +468,9 @@ impl Shader {
         };
         #[cfg(test)]
         self.heap_props.push(props);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { heap_views() } - 1);
+        let over = self.m.cmp(block, super::bitcode::pred::IUGT, index, last);
+        let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(false));
         let h = self.op(
             block,
