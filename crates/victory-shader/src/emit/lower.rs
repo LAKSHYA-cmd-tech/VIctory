@@ -5441,7 +5441,16 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        let mut guard = self.guard(b, i)?;
+        // Scalar results are written regardless of EXEC. In compute,
+        // v_readfirstlane still needs EXEC to select the source lane.
+        let mut guard = match v.dst {
+            Some(Operand::Scalar { .. })
+                if name != "v_readfirstlane_b32" || self.x.native.stage != HwStage::Cs =>
+            {
+                None
+            }
+            _ => self.guard(b, i)?,
+        };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d)?;
             guard = match (guard, enable) {
