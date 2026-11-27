@@ -82,11 +82,25 @@ struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// `VICTORY_BURY_LAG`: how many completed submissions to keep [`retire`]d
+/// host resources before releasing them (0: release after the submission
+/// that may have seen them).
+fn bury_lag() -> u64 {
+    static LAG: OnceLock<u64> = OnceLock::new();
+    *LAG.get_or_init(|| {
+        std::env::var("VICTORY_BURY_LAG")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Drops `object` once every submission running now (and `VICTORY_BURY_LAG`
+/// additional submissions, if set) has finished: at once if none is and lag is 0.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
+    let lag = bury_lag();
+    if lag == 0 && started <= FINISHED.load(Ordering::Acquire) {
         drop(object);
         return;
     }
@@ -96,8 +110,9 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
-/// Drops what waited for submissions up to `finished`.
+/// Drops what waited for submissions up to `finished` (adjusted for `VICTORY_BURY_LAG`).
 fn bury(finished: u64) {
+    let threshold = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
@@ -105,7 +120,7 @@ fn bury(finished: u64) {
         }
         let (done, keep) = std::mem::take(&mut *retired)
             .into_iter()
-            .partition(|(at, _)| *at <= finished);
+            .partition(|(at, _)| *at <= threshold);
         *retired = keep;
         done
     };
@@ -126,7 +141,7 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] = [
 ];
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
-/// refreshes (microseconds, bytes hashed), since the last frame-rate line.
+/// refreshes (microseconds, bytes staged), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -3182,5 +3197,26 @@ mod batch {
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn parse_bury_lag_handles_env_values() {
+        let parse = |v: Option<&str>| v.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+        assert_eq!(parse(None), 0);
+        assert_eq!(parse(Some("")), 0);
+        assert_eq!(parse(Some("0")), 0);
+        assert_eq!(parse(Some("3")), 3);
+        assert_eq!(parse(Some("  4  ")), 4);
+        assert_eq!(parse(Some("bad")), 0);
+    }
+
+    #[test]
+    fn bury_threshold_respects_submission_lag() {
+        let threshold = |finished: u64, lag: u64| finished.saturating_sub(lag);
+        assert_eq!(threshold(1, 0), 1);
+        assert_eq!(threshold(1, 2), 0);
+        assert_eq!(threshold(2, 2), 0);
+        assert_eq!(threshold(3, 2), 1);
+        assert_eq!(threshold(4, 2), 2);
     }
 }

@@ -298,7 +298,7 @@ impl Staging {
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
-    /// Returns the bytes of title memory read.
+    /// Returns the bytes staged for upload into the host texture (0 if unchanged).
     fn refresh_now(&self) -> usize {
         let Ok(size) = usize::try_from(self.layout.size) else {
             return 0;
@@ -332,7 +332,7 @@ impl Staging {
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            return self.size;
         }
         if last.committed_epoch != epoch {
             match committed_kind(self.memory, size) {
@@ -364,13 +364,13 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
-            return size;
+            return 0;
         }
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        size
+        self.size
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -994,5 +994,18 @@ mod tests {
         );
         assert!(!still_host_written(key));
         forget(key);
+    }
+
+    #[test]
+    fn unchanged_content_hash_indicates_zero_staged_bytes() {
+        let data = vec![0x33u8; 1024];
+        let hash = content_hash(&data);
+        let last_hash = Some(hash);
+        let changed = last_hash != Some(hash);
+        assert!(!changed);
+        let mut modified = data.clone();
+        modified[0] = 0x44;
+        let new_hash = content_hash(&modified);
+        assert_ne!(new_hash, hash);
     }
 }
