@@ -658,16 +658,25 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
         }
         let target = if immediate { src } else { dst };
         xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
+        xmm[target].High = 0;
     } else {
         let value = (xmm[src].Low & mask) << at_bit;
         xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
+        xmm[dst].High = 0;
     }
     Some(len)
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
+    let (code, at) =
+        unsafe { ((*(*info).ExceptionRecord).ExceptionCode, (*(*info).ContextRecord).Rip) };
+    // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
+        if code == EXCEPTION_ILLEGAL_INSTRUCTION {
+            // SAFETY: the title's code, at the instruction that faulted.
+            unsafe { crate::sse4a::replace(at as usize) };
+        }
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // A title ends its watchdog path with an unconditional `int3` after
